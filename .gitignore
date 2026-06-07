@@ -27,6 +27,7 @@ ENV/
 # Data files and models
 data/
 models/
+outputs/
 
 # Byte-compiled files
 *.pyc
