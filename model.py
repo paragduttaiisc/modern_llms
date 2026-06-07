@@ -30,15 +30,13 @@ class MultiHeadAttention(nn.Module):
         if self.flash: # Flash attention using PyTorch 2.0's built-in function
             out = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=None, is_causal=True,
-                dropout_p=self.dropout.p if self.training else 0.0
-            )
+                dropout_p=self.dropout.p if self.training else 0.0)
         else: # Fallback to manual SDPA implementation
             att = q @ k.transpose(-2, -1) * (self.head_size ** -0.5)
             att = att.masked_fill(self.mask[:T, :T] == 0, float('-inf')) # type: ignore
             att = F.softmax(att, dim=-1)
             att = self.dropout(att)
             out = att @ v
-
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         return self.dropout(self.proj(out))  # B, T, n_embed
 
