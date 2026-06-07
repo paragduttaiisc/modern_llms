@@ -5,40 +5,41 @@ from typing import Optional, Tuple, Union
 from utils import decode_text
 
 
-class Head(nn.Module):
-    def __init__(self, n_embed: int, head_size: int, block_size: int, dropout: float) -> None:
-        super().__init__()
-        self.key = nn.Linear(n_embed, head_size, bias=False)
-        self.query = nn.Linear(n_embed, head_size, bias=False)
-        self.value = nn.Linear(n_embed, head_size, bias=False)
-        self.register_buffer('mask', torch.tril(torch.ones(block_size, block_size)))
-        self.dropout = nn.Dropout(dropout)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, _ = x.shape
-        k = self.key(x)   # B, T, H
-        q = self.query(x) # B, T, H
-        v = self.value(x) # B, T, H
-
-        # Scaled Dot-product Attention (SDPA)
-        head_size = k.shape[-1]
-        att = q @ k.transpose(-2, -1) * head_size ** -0.5
-        att = att.masked_fill(self.mask[:T, :T] == 0, float('-inf')) # type: ignore
-        att = F.softmax(att, dim=-1)
-        att = self.dropout(att)
-        return att @ v  # B, T, H
-
-
 class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads: int, n_embed: int, block_size: int, dropout: float) -> None:
         super().__init__()
-        head_size = n_embed // num_heads
-        self.heads = nn.ModuleList([Head(n_embed, head_size, block_size, dropout) for _ in range(num_heads)])
+        self.num_heads = num_heads
+        self.head_size = n_embed // num_heads
+
+        self.attn_mat = nn.Linear(n_embed, 3 * n_embed, bias=False)
         self.proj = nn.Linear(n_embed, n_embed)
+        self.dropout = nn.Dropout(dropout)
+
+        self.flash = hasattr(F, 'scaled_dot_product_attention')
+        if not self.flash:
+            self.register_buffer('mask', torch.tril(torch.ones(block_size, block_size)))
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([h(x) for h in self.heads], dim=-1)  # B, T, num_heads * head_size
-        return self.proj(x)  # B, T, n_embed
+        B, T, C = x.shape
+        q, k, v = self.attn_mat(x).chunk(3, dim=-1)  # Each: B, T, n_embed
+        q = q.view(B, T, self.num_heads, self.head_size).transpose(1, 2)
+        k = k.view(B, T, self.num_heads, self.head_size).transpose(1, 2)
+        v = v.view(B, T, self.num_heads, self.head_size).transpose(1, 2)
+
+        if self.flash: # Optimized attention computation using PyTorch's built-in function
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=None, is_causal=True,
+                dropout_p=self.dropout.p if self.training else 0.0
+            )
+        else: # Fallback to manual SDPA implementation
+            att = q @ k.transpose(-2, -1) * (self.head_size ** -0.5)
+            att = att.masked_fill(self.mask[:T, :T] == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
+            att = self.dropout(att)
+            out = att @ v
+
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
+        return self.dropout(self.proj(out))  # B, T, n_embed
 
 
 class FeedForward(nn.Module):
@@ -46,7 +47,7 @@ class FeedForward(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_embed, 4 * n_embed),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(4 * n_embed, n_embed),
             nn.Dropout(dropout)
         )

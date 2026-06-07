@@ -16,18 +16,22 @@ def main(args):
     # create model and optimizer
     model = Model(len(token_to_idx), args).to(args.device)
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+    if int(torch.__version__[0]) == 2:
+        model = torch.compile(model)
 
     # Train the model
-    model.train()
-    for steps in range(args.n_iters + 1):
-        if steps % args.eval_interval == 0:
-            print(f"Evaluating at step: {steps} | ", end="")
-            train_loss, val_loss = evaluate(model, train_data, val_data, args)
-            print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
-        train_step(model, optimizer, train_data, args)
-    torch.save(model.state_dict(), f"{args.save_dir}/model.pth")
+    if args.train:
+        model.train()
+        for steps in range(args.n_iters + 1):
+            if steps % args.eval_interval == 0:
+                print(f"Evaluating at step: {steps} | ", end="")
+                train_loss, val_loss = evaluate(model, train_data, val_data, args)
+                print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+            train_step(model, optimizer, train_data, args)
+        torch.save(model.state_dict(), f"{args.save_dir}/model.pth")
 
-    # Generate text after training
+    # Generate text
+    model.load_state_dict(torch.load(f"{args.save_dir}/model.pth", map_location=args.device))
     model.eval()
     with torch.no_grad():
         start_idx = encode_text(args.prompt, token_to_idx).unsqueeze(0).to(args.device)
@@ -53,6 +57,7 @@ if __name__ == "__main__":
     parser.add_argument("--eval-iters", type=int, default=200)
     parser.add_argument("--prompt", type=str, default="\n")
     parser.add_argument("--max-new-tokens", type=int, default=10_000)
+    parser.add_argument("--train", action="store_true", help="Whether to train the model")
     args = parser.parse_args()
     set_seed(args.seed)
     main(args)
