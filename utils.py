@@ -3,11 +3,6 @@ import random
 from typing import Tuple
 
 
-class Config:
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
-
-
 def set_seed(seed: int):
     random.seed(seed)
     torch.manual_seed(seed)
@@ -45,7 +40,9 @@ def train_test_split(
 
 
 def pretty_count(count: int) -> str:
-    if count >= 1_000_000:
+    if count >= 1_000_000_000:
+        return f"{count / 1_000_000_000:.2f}B"
+    elif count >= 1_000_000:
         return f"{count / 1_000_000:.2f}M"
     elif count >= 1_000:
         return f"{count / 1_000:.2f}K"
