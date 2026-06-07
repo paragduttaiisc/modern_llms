@@ -1,10 +1,14 @@
-import torch
+import argparse
+import torch, torch.nn as nn
 from utils import get_batch
 
 
-def train_step(model, optimizer, train_data, batch_size, block_size, device):
-    inputs, targets = get_batch(train_data, batch_size, block_size)
-    inputs, targets = inputs.to(device), targets.to(device)
+def train_step(
+        model: nn.Module, optimizer: torch.optim.Optimizer,
+        train_data: torch.Tensor, args: argparse.Namespace
+) -> float:
+    inputs, targets = get_batch(train_data, args.batch_size, args.block_size)
+    inputs, targets = inputs.to(args.device), targets.to(args.device)
     _, loss = model(inputs, targets)
     if optimizer is not None:
         optimizer.zero_grad()
@@ -13,13 +17,16 @@ def train_step(model, optimizer, train_data, batch_size, block_size, device):
     return loss.item()
 
 
-def evaluate(model, train_data, val_data, batch_size, block_size, eval_iters, device):
-    def get_avg_loss(data):
+def evaluate(
+        model: nn.Module, train_data: torch.Tensor,
+        val_data: torch.Tensor, args: argparse.Namespace
+) -> tuple[float, float]:
+    def get_avg_loss(data: torch.Tensor) -> float:
         loss = 0
-        for _ in range(eval_iters):
+        for _ in range(args.eval_iters):
             loss += train_step(
-                model, None, data, batch_size, block_size, device)
-        return loss / eval_iters
+                model, None, data, args)
+        return loss / args.eval_iters
 
     model.eval()
     with torch.no_grad():

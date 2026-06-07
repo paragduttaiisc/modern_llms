@@ -24,8 +24,9 @@ ENV/
 # VS Code
 .vscode/
 
-# Data files
+# Data files and models
 data/
+models/
 
 # Byte-compiled files
 *.pyc
