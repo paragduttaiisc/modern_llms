@@ -1,3 +1,4 @@
+import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -5,40 +6,41 @@ from typing import Optional, Tuple, Union
 from utils import decode_text
 
 
-class Head(nn.Module):
-    def __init__(self, n_embed: int, head_size: int, block_size: int, dropout: float) -> None:
-        super().__init__()
-        self.key = nn.Linear(n_embed, head_size, bias=False)
-        self.query = nn.Linear(n_embed, head_size, bias=False)
-        self.value = nn.Linear(n_embed, head_size, bias=False)
-        self.register_buffer('mask', torch.tril(torch.ones(block_size, block_size)))
-        self.dropout = nn.Dropout(dropout)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, _ = x.shape
-        k = self.key(x)   # B, T, H
-        q = self.query(x) # B, T, H
-        v = self.value(x) # B, T, H
-
-        # Scaled Dot-product Attention (SDPA)
-        head_size = k.shape[-1]
-        att = q @ k.transpose(-2, -1) * head_size ** -0.5
-        att = att.masked_fill(self.mask[:T, :T] == 0, float('-inf')) # type: ignore
-        att = F.softmax(att, dim=-1)
-        att = self.dropout(att)
-        return att @ v  # B, T, H
-
-
 class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads: int, n_embed: int, block_size: int, dropout: float) -> None:
         super().__init__()
-        head_size = n_embed // num_heads
-        self.heads = nn.ModuleList([Head(n_embed, head_size, block_size, dropout) for _ in range(num_heads)])
+        self.num_heads = num_heads
+        self.head_size = n_embed // num_heads
+
+        self.attn_mat = nn.Linear(n_embed, 3 * n_embed, bias=False)
         self.proj = nn.Linear(n_embed, n_embed)
+        self.dropout = nn.Dropout(dropout)
+
+        self.flash = hasattr(F, 'scaled_dot_product_attention')
+        if not self.flash:
+            self.register_buffer('mask', torch.tril(torch.ones(block_size, block_size)))
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([h(x) for h in self.heads], dim=-1)  # B, T, num_heads * head_size
-        return self.proj(x)  # B, T, n_embed
+        B, T, C = x.shape
+        q, k, v = self.attn_mat(x).chunk(3, dim=-1)  # Each: B, T, n_embed
+        q = q.view(B, T, self.num_heads, self.head_size).transpose(1, 2)
+        k = k.view(B, T, self.num_heads, self.head_size).transpose(1, 2)
+        v = v.view(B, T, self.num_heads, self.head_size).transpose(1, 2)
+
+        if self.flash: # Flash attention using PyTorch 2.0's built-in function
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=None, is_causal=True,
+                dropout_p=self.dropout.p if self.training else 0.0
+            )
+        else: # Fallback to manual SDPA implementation
+            att = q @ k.transpose(-2, -1) * (self.head_size ** -0.5)
+            att = att.masked_fill(self.mask[:T, :T] == 0, float('-inf')) # type: ignore
+            att = F.softmax(att, dim=-1)
+            att = self.dropout(att)
+            out = att @ v
+
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
+        return self.dropout(self.proj(out))  # B, T, n_embed
 
 
 class FeedForward(nn.Module):
@@ -46,7 +48,7 @@ class FeedForward(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_embed, 4 * n_embed),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(4 * n_embed, n_embed),
             nn.Dropout(dropout)
         )
@@ -56,9 +58,12 @@ class FeedForward(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, n_embed: int, num_heads: int, block_size: int, dropout: float) -> None:
+    def __init__(
+            self, n_embed: int, num_heads: int, block_size: int, dropout: float
+    ) -> None:
         super().__init__()
-        self.sa_heads = MultiHeadAttention(num_heads, n_embed, block_size, dropout)
+        self.sa_heads =\
+            MultiHeadAttention(num_heads, n_embed, block_size, dropout)
         self.ffwd = FeedForward(n_embed, dropout)
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
@@ -70,12 +75,14 @@ class Block(nn.Module):
 
 
 class Model(nn.Module):
-    def __init__(self, vocab_size: int, args) -> None:
+    def __init__(self, vocab_size: int, args: argparse.Namespace) -> None:
         super().__init__()
         self.tok_emb_table = nn.Embedding(vocab_size, args.n_embed)
         self.pos_emb_table = nn.Embedding(args.block_size, args.n_embed)
-        self.layers = nn.ModuleList(
-            [Block(args.n_embed, args.n_heads, args.block_size, args.dropout) for _ in range(args.n_layers)])
+        self.layers = nn.ModuleList([
+            Block(args.n_embed, args.n_heads, args.block_size, args.dropout)
+            for _ in range(args.n_layers)
+        ])
         self.ln_f = nn.LayerNorm(args.n_embed)
         self.lm_head = nn.Linear(args.n_embed, vocab_size)
         self.block_size = args.block_size
@@ -100,7 +107,9 @@ class Model(nn.Module):
             loss = F.cross_entropy(logits, targets)
         return logits, loss
     
-    def generate(self, prompt: torch.Tensor, idx_to_token: dict, max_new_tokens: int) -> None:
+    def generate(
+            self, prompt: torch.Tensor, idx_to_token: dict, max_new_tokens: int
+    ) -> None:
         print("Generating text...")
         generated = prompt.clone()
         print(decode_text(generated[0], idx_to_token), end='', flush=True)
