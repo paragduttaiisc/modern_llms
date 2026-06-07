@@ -1,0 +1,37 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+eggs/
+*.egg-info/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# Pytest / mypy
+.pytest_cache/
+.mypy_cache/
+
+# VS Code
+.vscode/
+
+# Data files
+data/
+
+# Byte-compiled files
+*.pyc
+*.pyo
+*.pyd
+
+# Editor backups
+*~
+*.swp
