@@ -6,32 +6,36 @@ from train_utils import train_step, evaluate
 from utils import set_seed, load_data, tokenize_char, encode_text, train_test_split
 
 
-def main(args):
+def main(args: argparse.Namespace):
     # Load data
     data = load_data(args.data_path)
     token_to_idx, idx_to_token = tokenize_char(data)
     encoded_data = encode_text(data, token_to_idx)
     train_data, val_data = train_test_split(encoded_data, test_size=args.test_size)
 
-    # create model and optimizer
+    # create model
     model = Model(len(token_to_idx), args).to(args.device)
-    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+    if hasattr(torch, 'compile'):
+        model: torch.nn.Module = torch.compile(model) # type: ignore
 
     # Train the model
-    model.train()
-    for steps in range(args.n_iters + 1):
-        if steps % args.eval_interval == 0:
-            print(f"Evaluating at step: {steps} | ", end="")
-            train_loss, val_loss = evaluate(model, train_data, val_data, args)
-            print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
-        train_step(model, optimizer, train_data, args)
-    torch.save(model.state_dict(), f"{args.save_dir}/model.pth")
+    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+    if args.train:
+        model.train()
+        for steps in range(args.n_iters + 1):
+            if steps % args.eval_interval == 0:
+                print(f"Evaluating at step: {steps} | ", end="")
+                train_loss, val_loss = evaluate(model, train_data, val_data, args)
+                print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+            train_step(model, optimizer, train_data, args)
+        torch.save(model.state_dict(), f"{args.save_dir}/model.pth")
 
-    # Generate text after training
+    # Generate text
+    model.load_state_dict(torch.load(f"{args.save_dir}/model.pth", map_location=args.device))
     model.eval()
     with torch.no_grad():
         start_idx = encode_text(args.prompt, token_to_idx).unsqueeze(0).to(args.device)
-        model.generate(start_idx, idx_to_token, max_new_tokens=args.max_new_tokens)
+        model.generate(start_idx, idx_to_token, max_new_tokens=args.max_new_tokens) # type: ignore
 
 
 if __name__ == "__main__":
@@ -53,6 +57,7 @@ if __name__ == "__main__":
     parser.add_argument("--eval-iters", type=int, default=200)
     parser.add_argument("--prompt", type=str, default="\n")
     parser.add_argument("--max-new-tokens", type=int, default=10_000)
+    parser.add_argument("--train", action="store_true", help="Whether to train the model")
     args = parser.parse_args()
     set_seed(args.seed)
     main(args)
