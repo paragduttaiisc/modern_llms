@@ -21,13 +21,22 @@ ENV/
 .pytest_cache/
 .mypy_cache/
 
-# VS Code
+# Coding IDEs
 .vscode/
+.idea/
 
 # Data files and models
 data/
 models/
 outputs/
+
+# Logs
+logs/
+wandb/
+
+# AI agent helpers
+AGENT.md
+CLAUDE.md
 
 # Byte-compiled files
 *.pyc
