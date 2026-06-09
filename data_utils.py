@@ -7,19 +7,6 @@ from typing import Tuple, List, Dict, Optional
 from utils import train_test_split
 
 
-# class Tokenizer:
-#     def __init__(self, text: str) -> None:
-#         chars = sorted(list(set(text)))
-#         self.token_to_idx = {char: idx for idx, char in enumerate(chars)}
-#         self.idx_to_token = {idx: char for char, idx in self.token_to_idx.items()}
-
-#     def encode(self, text: str) -> torch.Tensor:
-#         return torch.tensor([self.token_to_idx[char] for char in text], dtype=torch.long)
-
-#     def decode(self, encoded_text: torch.Tensor) -> str:
-#         return ''.join([self.idx_to_token[idx.item()] for idx in encoded_text]) # type: ignore
-
-
 class Tokenizer(PreTrainedTokenizer):
     model_input_names = ["input_ids"]
     def __init__(self, text: str, **kwargs) -> None:
