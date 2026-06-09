@@ -1,11 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import PreTrainedModel, PreTrainedConfig
+from transformers import PreTrainedConfig, PreTrainedModel, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutput
 from typing import Optional
-
-from data_utils import Tokenizer
 
 
 class ModelConfig(PreTrainedConfig):
@@ -15,19 +13,19 @@ class ModelConfig(PreTrainedConfig):
             self,
             vocab_size: int = 65,
             block_size: int = 256,
-            n_embed: int = 384,
-            n_layers: int = 6,
-            n_heads: int = 4,
+            hidden_size: int = 384,
+            num_hidden_layers: int = 6,
+            num_attention_heads: int = 4,
             dropout: float = 0.2,
             **kwargs
     ) -> None:
         super().__init__(**kwargs)
         self.vocab_size = vocab_size
         self.block_size = block_size
-        self.n_embed = n_embed
-        self.n_layers = n_layers
-        self.n_heads = n_heads
         self.dropout = dropout
+        self.num_hidden_layers = num_hidden_layers
+        self.hidden_size = hidden_size
+        self.num_attention_heads = num_attention_heads
 
 
 class MultiHeadAttention(nn.Module):
@@ -86,8 +84,8 @@ class Block(nn.Module):
             self, n_embed: int, num_heads: int, block_size: int, dropout: float
     ) -> None:
         super().__init__()
-        self.sa_heads =\
-            MultiHeadAttention(num_heads, n_embed, block_size, dropout)
+        self.sa_heads = MultiHeadAttention(
+            num_heads, n_embed, block_size, dropout)
         self.ffwd = FeedForward(n_embed, dropout)
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
@@ -98,31 +96,37 @@ class Block(nn.Module):
         return x
 
 
-class Model(PreTrainedModel):
+class Model(PreTrainedModel, GenerationMixin):
     config_class = ModelConfig
     base_model_prefix = "modern_transformer"
 
     def __init__(self, config) -> None:
         super().__init__(config)
-        self.tok_emb_table = nn.Embedding(config.vocab_size, config.n_embed)
-        self.pos_emb_table = nn.Embedding(config.block_size, config.n_embed)
+        self.tok_emb_table = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.pos_emb_table = nn.Embedding(config.block_size, config.hidden_size)
         self.emb_drop = nn.Dropout(config.dropout)
         self.layers = nn.ModuleList([
-            Block(config.n_embed, config.n_heads, config.block_size, config.dropout)
-            for _ in range(config.n_layers)
+            Block(
+                config.hidden_size, config.num_attention_heads,
+                config.block_size, config.dropout
+            ) for _ in range(config.num_hidden_layers)
         ])
-        self.ln_f = nn.LayerNorm(config.n_embed)
-        self.lm_head = nn.Linear(config.n_embed, config.vocab_size)
+        self.ln_f = nn.LayerNorm(config.hidden_size)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size)
         self.block_size = config.block_size
 
         self.post_init()
+    
+    def prepare_inputs_for_generation(self, input_ids, **kwargs):
+        return {"input_ids": input_ids[:, -self.block_size:]}
 
     def forward(
-            self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None
+            self, input_ids: torch.Tensor,
+            targets: Optional[torch.Tensor] = None, **kwargs
     ) -> CausalLMOutput:
-        B, T = idx.shape
-        tok_embs = self.tok_emb_table(idx)
-        pos_embs = self.pos_emb_table(torch.arange(T, device=idx.device))
+        B, T = input_ids.shape
+        tok_embs = self.tok_emb_table(input_ids)
+        pos_embs = self.pos_emb_table(torch.arange(T, device=input_ids.device))
         x = self.emb_drop(tok_embs + pos_embs)
         for layer in self.layers:
             x = layer(x)
@@ -132,30 +136,5 @@ class Model(PreTrainedModel):
             loss = None
         else:
             B, T, C = logits.shape
-            # logits = logits.reshape(B * T, C)
-            # targets = targets.reshape(B * T)
             loss = F.cross_entropy(logits.view(-1, C), targets.view(-1))
         return CausalLMOutput(logits=logits, loss=loss)  # type: ignore
-    
-    def generate_stream(
-            self, prompt: torch.Tensor, tokenizer: Tokenizer, max_new_tokens: int
-    ) -> None:
-        print("Generating text...")
-        print(tokenizer.decode(prompt[0]), end='', flush=True)
-        prompt = prompt[:, -self.block_size:]
-        for _ in range(max_new_tokens):
-            T = prompt.shape[1]
-            tok_embs = self.tok_emb_table(prompt)  # B, T, C
-            pos_embs = self.pos_emb_table(torch.arange(T, device=prompt.device))  # T, C
-            x = self.emb_drop(tok_embs + pos_embs)  # B, T, C
-
-            for layer in self.layers:
-                x = layer(x)
-            logits = self.lm_head(self.ln_f(x))  # B, T, vocab_size
-            logits = logits[:, -1, :]  # B, vocab_size (take the last timestep)
-
-            probs = F.softmax(logits, dim=-1)  # Convert logits to probabilities
-            next_idx = torch.multinomial(probs, num_samples=1)  # Sample the next token (B,1)
-            prompt = torch.cat([prompt, next_idx], dim=1)[:, -self.block_size:]
-            print(tokenizer.decode(next_idx[0]), end='', flush=True)
-        print()

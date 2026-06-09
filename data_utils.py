@@ -1,22 +1,57 @@
 import argparse
 import torch
+from transformers import PreTrainedTokenizer
 from torch.utils.data import Dataset, DataLoader
-from typing import Tuple
+from typing import Tuple, List, Dict, Optional
 
 from utils import train_test_split
 
 
-class Tokenizer:
-    def __init__(self, text: str) -> None:
+# class Tokenizer:
+#     def __init__(self, text: str) -> None:
+#         chars = sorted(list(set(text)))
+#         self.token_to_idx = {char: idx for idx, char in enumerate(chars)}
+#         self.idx_to_token = {idx: char for char, idx in self.token_to_idx.items()}
+
+#     def encode(self, text: str) -> torch.Tensor:
+#         return torch.tensor([self.token_to_idx[char] for char in text], dtype=torch.long)
+
+#     def decode(self, encoded_text: torch.Tensor) -> str:
+#         return ''.join([self.idx_to_token[idx.item()] for idx in encoded_text]) # type: ignore
+
+
+class Tokenizer(PreTrainedTokenizer):
+    model_input_names = ["input_ids"]
+    def __init__(self, text: str, **kwargs) -> None:
         chars = sorted(list(set(text)))
         self.token_to_idx = {char: idx for idx, char in enumerate(chars)}
         self.idx_to_token = {idx: char for char, idx in self.token_to_idx.items()}
+        super().__init__(pad_token=None, eos_token=None, **kwargs)
+    
+    @property
+    def vocab_size(self) -> int:
+        return len(self.token_to_idx)
 
-    def encode(self, text: str) -> torch.Tensor:
+    def get_vocab(self) -> Dict[str, int]:
+        return self.token_to_idx
+
+    def _tokenize(self, text: str, **kwargs) -> List[str]:
+        return list(text)
+
+    def _convert_token_to_id(self, token: str) -> int:
+        return self.token_to_idx.get(token, 0)
+
+    def _convert_id_to_token(self, index: int) -> str:
+        return self.idx_to_token.get(index, "")
+    
+    def convert_tokens_to_string(self, tokens: List[str]) -> str:
+        return "".join(tokens) # TODO: remove this method when using subword tokenization
+
+    def save_vocabulary(self, save_directory: str, filename_prefix: Optional[str] = None) -> tuple:
+        return ()
+
+    def encode(self, text: str, **kwargs) -> torch.Tensor:
         return torch.tensor([self.token_to_idx[char] for char in text], dtype=torch.long)
-
-    def decode(self, encoded_text: torch.Tensor) -> str:
-        return ''.join([self.idx_to_token[idx.item()] for idx in encoded_text]) # type: ignore
 
 
 class TextDataset(Dataset):
@@ -32,13 +67,15 @@ class TextDataset(Dataset):
         return sequence[:-1].long(), sequence[1:].long()
 
 
-def get_dataloader_and_tokenizer(
-        args: argparse.Namespace) -> Tuple[DataLoader, DataLoader, Tokenizer]:
-    with open(args.data_path, 'r', encoding='utf-8') as f:
-        text = f.read()
-    tokenizer = Tokenizer(text)
-    data = tokenizer.encode(text)
-    train_data, val_data = train_test_split(data)
+def load_text_corpus(data_path: str) -> str:
+    with open(data_path, 'r', encoding='utf-8') as f:
+        return f.read()
+
+
+def get_dataloaders(
+        data: torch.Tensor, args: argparse.Namespace
+) -> Tuple[DataLoader, DataLoader]:
+    train_data, val_data = train_test_split(data, test_size=args.test_size)
     train_dataset = TextDataset(train_data, args.block_size)
     val_dataset = TextDataset(val_data, args.block_size)
     train_dataloader = DataLoader(
@@ -49,4 +86,4 @@ def get_dataloader_and_tokenizer(
         val_dataset, batch_size=args.batch_size,
         shuffle=True, num_workers=args.num_workers
     )
-    return train_dataloader, val_dataloader, tokenizer
+    return train_dataloader, val_dataloader
