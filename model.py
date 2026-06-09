@@ -1,13 +1,39 @@
-import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, Union
-from utils import decode_text
+from transformers import PreTrainedModel, PreTrainedConfig
+from transformers.modeling_outputs import CausalLMOutput
+from typing import Optional
+
+from data_utils import Tokenizer
+
+
+class ModelConfig(PreTrainedConfig):
+    model_type = "modern_transformer"
+
+    def __init__(
+            self,
+            vocab_size: int = 65,
+            block_size: int = 256,
+            n_embed: int = 384,
+            n_layers: int = 6,
+            n_heads: int = 4,
+            dropout: float = 0.2,
+            **kwargs
+    ) -> None:
+        super().__init__(**kwargs)
+        self.vocab_size = vocab_size
+        self.block_size = block_size
+        self.n_embed = n_embed
+        self.n_layers = n_layers
+        self.n_heads = n_heads
+        self.dropout = dropout
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, num_heads: int, n_embed: int, block_size: int, dropout: float) -> None:
+    def __init__(
+            self, num_heads: int, n_embed: int, block_size: int, dropout: float
+    ) -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_size = n_embed // num_heads
@@ -72,26 +98,32 @@ class Block(nn.Module):
         return x
 
 
-class Model(nn.Module):
-    def __init__(self, vocab_size: int, args: argparse.Namespace) -> None:
-        super().__init__()
-        self.tok_emb_table = nn.Embedding(vocab_size, args.n_embed)
-        self.pos_emb_table = nn.Embedding(args.block_size, args.n_embed)
+class Model(PreTrainedModel):
+    config_class = ModelConfig
+    base_model_prefix = "modern_transformer"
+
+    def __init__(self, config) -> None:
+        super().__init__(config)
+        self.tok_emb_table = nn.Embedding(config.vocab_size, config.n_embed)
+        self.pos_emb_table = nn.Embedding(config.block_size, config.n_embed)
+        self.emb_drop = nn.Dropout(config.dropout)
         self.layers = nn.ModuleList([
-            Block(args.n_embed, args.n_heads, args.block_size, args.dropout)
-            for _ in range(args.n_layers)
+            Block(config.n_embed, config.n_heads, config.block_size, config.dropout)
+            for _ in range(config.n_layers)
         ])
-        self.ln_f = nn.LayerNorm(args.n_embed)
-        self.lm_head = nn.Linear(args.n_embed, vocab_size)
-        self.block_size = args.block_size
+        self.ln_f = nn.LayerNorm(config.n_embed)
+        self.lm_head = nn.Linear(config.n_embed, config.vocab_size)
+        self.block_size = config.block_size
+
+        self.post_init()
 
     def forward(
             self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, Union[torch.Tensor, None]]:
+    ) -> CausalLMOutput:
         B, T = idx.shape
         tok_embs = self.tok_emb_table(idx)
         pos_embs = self.pos_emb_table(torch.arange(T, device=idx.device))
-        x = tok_embs + pos_embs
+        x = self.emb_drop(tok_embs + pos_embs)
         for layer in self.layers:
             x = layer(x)
         logits = self.lm_head(self.ln_f(x))
@@ -100,23 +132,22 @@ class Model(nn.Module):
             loss = None
         else:
             B, T, C = logits.shape
-            logits = logits.view(B * T, C)
-            targets = targets.view(B * T)
-            loss = F.cross_entropy(logits, targets)
-        return logits, loss
+            # logits = logits.reshape(B * T, C)
+            # targets = targets.reshape(B * T)
+            loss = F.cross_entropy(logits.view(-1, C), targets.view(-1))
+        return CausalLMOutput(logits=logits, loss=loss)  # type: ignore
     
-    def generate(
-            self, prompt: torch.Tensor, idx_to_token: dict, max_new_tokens: int
+    def generate_stream(
+            self, prompt: torch.Tensor, tokenizer: Tokenizer, max_new_tokens: int
     ) -> None:
         print("Generating text...")
-        generated = prompt.clone()
-        print(decode_text(generated[0], idx_to_token), end='', flush=True)
+        print(tokenizer.decode(prompt[0]), end='', flush=True)
         prompt = prompt[:, -self.block_size:]
         for _ in range(max_new_tokens):
             T = prompt.shape[1]
             tok_embs = self.tok_emb_table(prompt)  # B, T, C
             pos_embs = self.pos_emb_table(torch.arange(T, device=prompt.device))  # T, C
-            x = tok_embs + pos_embs  # B, T, C
+            x = self.emb_drop(tok_embs + pos_embs)  # B, T, C
 
             for layer in self.layers:
                 x = layer(x)
@@ -125,7 +156,6 @@ class Model(nn.Module):
 
             probs = F.softmax(logits, dim=-1)  # Convert logits to probabilities
             next_idx = torch.multinomial(probs, num_samples=1)  # Sample the next token (B,1)
-            generated = torch.cat([generated, next_idx], dim=1)
             prompt = torch.cat([prompt, next_idx], dim=1)[:, -self.block_size:]
-            print(decode_text(next_idx[0], idx_to_token), end='', flush=True)
+            print(tokenizer.decode(next_idx[0]), end='', flush=True)
         print()
