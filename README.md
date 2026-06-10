@@ -21,10 +21,19 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Notes
+# Train and Infer
 
-- Data files are excluded from version control (`data/` is ignored).
-- Adjust training scripts and hyperparameters in `train_utils.py` and `main.py`.
+- To train a model, run `train.py` with appropriate arguments. For example:
+
+```bash
+accelerate launch train.py --save-dir models/your_model --max-iters 500 --wandb-name your_model_run
+```
+
+- To generate text using a trained model, run `infer.py` with appropriate arguments. For example:
+
+```bash
+python infer.py --save-dir models/your_model --prompt "To be, or not" --max-new-tokens 200 --temperature 0.85 --num-return-sequences 3
+```
 
 ## License
 
