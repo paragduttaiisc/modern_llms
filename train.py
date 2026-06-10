@@ -1,25 +1,21 @@
-import os, argparse, wandb, time
+import os
+import argparse
 import torch, torch.optim as optim
-from accelerate import Accelerator
-from transformers import set_seed
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+from transformers import set_seed, TrainingArguments, Trainer
 
 from model import Model, ModelConfig
-from data_utils import load_text_corpus, Tokenizer, get_dataloaders
-from train_utils import train
-torch.set_float32_matmul_precision('high')
+from data_utils import load_text_corpus, Tokenizer, split_dataset
 
 
 def main(args: argparse.Namespace):
-    accelerator = Accelerator()
-    args.device = accelerator.device
-    
     # Prepare data
     text_cropus = load_text_corpus(args.data_path)
     tokenizer = Tokenizer(text_cropus)
     data = tokenizer.encode(text_cropus)
-    train_loader, val_loader = get_dataloaders(data, args)
+    train_dataset, val_dataset = split_dataset(data, args)
 
-    # create model
+    # create model and optimizer
     model = Model(ModelConfig(
         vocab_size=len(tokenizer.token_to_idx),
         block_size=args.block_size,
@@ -27,55 +23,82 @@ def main(args: argparse.Namespace):
         num_hidden_layers=args.n_layers,
         num_attention_heads=args.n_heads,
         dropout=args.dropout
-    )).to(args.device)
-    if hasattr(torch, 'compile'):
-        model: torch.nn.Module = torch.compile(model) # type: ignore
-
-    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
-    model, optimizer, train_loader, val_loader = accelerator.prepare(
-        model, optimizer, train_loader, val_loader)
-    wandb_run = None
-    if accelerator.is_main_process:
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
-        args.save_dir = os.path.join(args.save_dir, timestamp)
-        os.makedirs(args.save_dir, exist_ok=True)
-        if args.wandb_run_name is not None:
-            wandb.init(
-                name=f"{args.wandb_run_name}_{timestamp}",
-                project=args.wandb_project,
-                entity=args.wandb_entity,
-                config=vars(args)
-            )
-            wandb_run = wandb.run
-    train(
-        model, optimizer, train_loader, val_loader,
-        accelerator, args, wandb_run
+    ))
+    optimizer = optim.AdamW(
+        model.parameters(), lr=args.learning_rate,
+        weight_decay=args.weight_decay, betas=(0.9, 0.95))
+    warmup_scheduler = LinearLR(
+        optimizer, start_factor=1e-6, total_iters=args.warmup_iters)
+    cosine_scheduler = CosineAnnealingLR(
+        optimizer, T_max=args.n_iters - args.warmup_iters,
+        eta_min=args.learning_rate / 10)
+    scheduler = SequentialLR(
+        optimizer, schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[args.warmup_iters])
+    
+    # train
+    training_args = TrainingArguments(
+        output_dir=args.save_dir,
+        torch_compile=True,
+        max_steps=args.n_iters,
+        per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.batch_size,
+        eval_on_start=True,
+        eval_strategy="steps",
+        eval_steps=args.eval_interval,
+        save_steps=args.save_interval,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+        bf16=args.use_bf16 and torch.cuda.is_available(),
+        logging_steps=args.log_interval,
+        report_to="wandb" if args.wandb_run_name else "none",
+        run_name=args.wandb_run_name,
+        project=args.wandb_project,
+        max_grad_norm=args.max_grad_norm,
+        dataloader_num_workers=args.num_workers,
+        ddp_find_unused_parameters=False
     )
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        optimizers=(optimizer, scheduler) # type: ignore
+    )
+    trainer.train()
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a character-level transformer for next-character prediction")
     parser.add_argument("--seed", type=int, default=2026)
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--data-path", type=str, default="data/tinyshakespeare.txt")
     parser.add_argument("--save-dir", type=str, default="models")
-    parser.add_argument("--test-size", type=float, default=0.1)
+    parser.add_argument("--test-size", type=float, default=0.05)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--n-embed", type=int, default=384)
     parser.add_argument("--n-heads", type=int, default=4)
     parser.add_argument("--n-layers", type=int, default=6)
-    parser.add_argument("--n-iters", type=int, default=1000)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--n-iters", type=int, default=500)
+    parser.add_argument("--warmup-iters", type=int, default=20)
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--eval-interval", type=int, default=100)
-    parser.add_argument("--save-interval", type=int, default=400)
+    parser.add_argument("--save-interval", type=int, default=500)
     parser.add_argument("--eval-iters", type=int, default=5)
+    parser.add_argument("--use-bf16", action="store_true")
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--wandb-project", type=str, default="improved-transformer")
     parser.add_argument("--wandb-entity", type=str, default="statsml-csa-iisc")
     args = parser.parse_args()
+    torch.set_float32_matmul_precision('medium' if args.use_bf16 else 'high')
     set_seed(args.seed)
+    os.environ["WANDB_PROJECT"] = args.wandb_project
+    os.environ["WANDB_ENTITY"] = args.wandb_entity
     main(args)
