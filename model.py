@@ -99,6 +99,7 @@ class Block(nn.Module):
 class Model(PreTrainedModel, GenerationMixin):
     config_class = ModelConfig
     base_model_prefix = "modern_transformer"
+    _tied_weights_keys = {"lm_head.weight": "tok_emb_table.weight"}
 
     def __init__(self, config) -> None:
         super().__init__(config)
@@ -114,17 +115,32 @@ class Model(PreTrainedModel, GenerationMixin):
         self.ln_f = nn.LayerNorm(config.hidden_size)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size)
         self.block_size = config.block_size
-
+        
+        self.config.tie_word_embeddings = True
         self.post_init()
-    
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.tok_emb_table
+
+    def set_input_embeddings(self, value: nn.Embedding) -> None:
+        self.tok_emb_table = value
+
+    def get_output_embeddings(self) -> nn.Linear:
+        return self.lm_head
+
+    def set_output_embeddings(self, value: nn.Linear) -> None:
+        self.lm_head = value
+
     def prepare_inputs_for_generation(self, input_ids, **kwargs):
         return {"input_ids": input_ids[:, -self.block_size:]}
 
     def forward(
             self, input_ids: torch.Tensor,
-            targets: Optional[torch.Tensor] = None, **kwargs
+            labels: Optional[torch.Tensor] = None,
+            num_items_in_batch: Optional[int] = None,
+            **kwargs
     ) -> CausalLMOutput:
-        B, T = input_ids.shape
+        _, T = input_ids.shape
         tok_embs = self.tok_emb_table(input_ids)
         pos_embs = self.pos_emb_table(torch.arange(T, device=input_ids.device))
         x = self.emb_drop(tok_embs + pos_embs)
@@ -132,9 +148,15 @@ class Model(PreTrainedModel, GenerationMixin):
             x = layer(x)
         logits = self.lm_head(self.ln_f(x))
 
-        if targets is None:
+        if labels is None:
             loss = None
         else:
-            B, T, C = logits.shape
-            loss = F.cross_entropy(logits.view(-1, C), targets.view(-1))
+            _, _, C = logits.shape
+            if num_items_in_batch is not None:
+                loss = F.cross_entropy(
+                    logits.view(-1, C), labels.view(-1), reduction="sum")
+                loss = loss / num_items_in_batch
+            else:
+                loss = F.cross_entropy(
+                    logits.view(-1, C), labels.view(-1), reduction="mean")
         return CausalLMOutput(logits=logits, loss=loss)  # type: ignore
