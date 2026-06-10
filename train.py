@@ -78,7 +78,7 @@ def main(args: argparse.Namespace):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train a character-level transformer for next-character prediction")
+    parser = argparse.ArgumentParser(description="Train a transformer")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--data-path", type=str, default="data/tinyshakespeare.txt")
     parser.add_argument("--save-dir", type=str, default="models")
