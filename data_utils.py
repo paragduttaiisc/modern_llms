@@ -1,8 +1,8 @@
 import argparse
 import torch
-from transformers import PreTrainedTokenizer
-from torch.utils.data import Dataset, DataLoader
 from typing import Tuple, List, Dict, Optional
+from transformers import PreTrainedTokenizer
+from torch.utils.data import Dataset
 
 from utils import train_test_split
 
@@ -49,9 +49,9 @@ class TextDataset(Dataset):
     def __len__(self) -> int:
         return len(self.data) - self.block_size - 1
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        sequence = self.data[idx:idx + self.block_size + 1]
-        return sequence[:-1].long(), sequence[1:].long()
+    def __getitem__(self, idx: int) -> dict:
+        seq = self.data[idx:idx + self.block_size + 1]
+        return {"input_ids": seq[:-1].long(), "labels": seq[1:].long()}
 
 
 def load_text_corpus(data_path: str) -> str:
@@ -59,18 +59,10 @@ def load_text_corpus(data_path: str) -> str:
         return f.read()
 
 
-def get_dataloaders(
+def split_dataset(
         data: torch.Tensor, args: argparse.Namespace
-) -> Tuple[DataLoader, DataLoader]:
+) -> Tuple[TextDataset, TextDataset]:
     train_data, val_data = train_test_split(data, test_size=args.test_size)
     train_dataset = TextDataset(train_data, args.block_size)
     val_dataset = TextDataset(val_data, args.block_size)
-    train_dataloader = DataLoader(
-        train_dataset, batch_size=args.batch_size,
-        shuffle=True, num_workers=args.num_workers
-    )
-    val_dataloader = DataLoader(
-        val_dataset, batch_size=args.batch_size,
-        shuffle=True, num_workers=args.num_workers
-    )
-    return train_dataloader, val_dataloader
+    return train_dataset, val_dataset
