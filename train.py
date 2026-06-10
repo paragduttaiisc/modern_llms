@@ -5,25 +5,32 @@ from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from transformers import set_seed, TrainingArguments, Trainer
 
 from model import Model, ModelConfig
-from data_utils import load_text_corpus, Tokenizer, split_dataset
+from data_utils import load_text_corpus, get_tokenizer, split_dataset
+from utils import pretty_count
 
 
 def main(args: argparse.Namespace):
     # Prepare data
     text_cropus = load_text_corpus(args.data_path)
-    tokenizer = Tokenizer(text_cropus)
-    data = tokenizer.encode(text_cropus)
+    tokenizer = get_tokenizer()
+    print(f"Tokenizer vocab size: {len(tokenizer)}")
+    data = tokenizer(text_cropus, return_tensors="pt")["input_ids"].squeeze()
+    print(f"Dataset size: {pretty_count(len(data))} tokens")
     train_dataset, val_dataset = split_dataset(data, args)
 
     # create model and optimizer
     model = Model(ModelConfig(
-        vocab_size=len(tokenizer.token_to_idx),
+        vocab_size=args.vocab_size,
         block_size=args.block_size,
         hidden_size=args.n_embed,
         num_hidden_layers=args.n_layers,
         num_attention_heads=args.n_heads,
         dropout=args.dropout
     ))
+    model.config.eos_token_id = tokenizer.eos_token_id
+    model.config.pad_token_id = tokenizer.pad_token_id
+    model.generation_config.eos_token_id = tokenizer.eos_token_id
+    model.generation_config.pad_token_id = tokenizer.pad_token_id
     optimizer = optim.AdamW(
         model.parameters(), lr=args.learning_rate,
         weight_decay=args.weight_decay, betas=(0.9, 0.95))
@@ -77,7 +84,8 @@ if __name__ == "__main__":
     parser.add_argument("--save-dir", type=str, default="models")
     parser.add_argument("--test-size", type=float, default=0.05)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--vocab-size", type=int, default=49216)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--n-embed", type=int, default=384)
     parser.add_argument("--n-heads", type=int, default=4)

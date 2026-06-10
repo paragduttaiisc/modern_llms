@@ -1,44 +1,35 @@
 import argparse
 import torch
-from typing import Tuple, List, Dict, Optional
-from transformers import PreTrainedTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizer
 from torch.utils.data import Dataset
+from typing import Tuple
 
 from utils import train_test_split
 
 
-class Tokenizer(PreTrainedTokenizer):
-    model_input_names = ["input_ids"]
-    def __init__(self, text: str, **kwargs) -> None:
-        chars = sorted(list(set(text)))
-        self.token_to_idx = {char: idx for idx, char in enumerate(chars)}
-        self.idx_to_token = {idx: char for char, idx in self.token_to_idx.items()}
-        super().__init__(pad_token=None, eos_token=None, **kwargs)
-    
-    @property
-    def vocab_size(self) -> int:
-        return len(self.token_to_idx)
+def get_tokenizer(tokenizer_path: str = "tokenizer") -> PreTrainedTokenizer:
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    except Exception as e:
+        print("Creating a new tokenizer...")
+        tokenizer = AutoTokenizer.from_pretrained("bigcode/starcoderbase")
+        SPL_TOKS = [
+            "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>", "<|fim_pad|>",
+            "<|filename|>", "<|gh_stars|>", "<|issue_start|>",
+            "<|issue_comment|>", "<|issue_closed|>", "<|jupyter_start|>",
+            "<|jupyter_text|>", "<|jupyter_code|>", "<|jupyter_output|>",
+            "<|empty_output|>", "<|commit_before|>", "<|commit_msg|>",
+            "<|commit_after|>", "<|reponame|>", "<|im_start|>", "<|im_end|>"
+            "<|vision_start|>", "<|vision_end|>", "<|image_pad|>",
+            "<|video_pad|>", "<|tool_start|>", "<|tool_end|>",
+            "<|tool_response_start|>", "<|tool_response_end|>",
+            "<|action_start|>", "<|action_end|>"]
+        SPL_TOKS.extend([
+            f"<|reserved_token_{i}|>" for i in range(64 - len(SPL_TOKS))])
+        tokenizer.add_special_tokens({"additional_special_tokens": SPL_TOKS})
+        tokenizer.save_pretrained(tokenizer_path)
+    return tokenizer
 
-    def get_vocab(self) -> Dict[str, int]:
-        return self.token_to_idx
-
-    def _tokenize(self, text: str, **kwargs) -> List[str]:
-        return list(text)
-
-    def _convert_token_to_id(self, token: str) -> int:
-        return self.token_to_idx.get(token, 0)
-
-    def _convert_id_to_token(self, index: int) -> str:
-        return self.idx_to_token.get(index, "")
-    
-    def convert_tokens_to_string(self, tokens: List[str]) -> str:
-        return "".join(tokens) # TODO: remove this method when using subword tokenization
-
-    def save_vocabulary(self, save_directory: str, filename_prefix: Optional[str] = None) -> tuple:
-        return ()
-
-    def encode(self, text: str, **kwargs) -> torch.Tensor:
-        return torch.tensor([self.token_to_idx[char] for char in text], dtype=torch.long)
 
 
 class TextDataset(Dataset):

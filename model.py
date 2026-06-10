@@ -135,7 +135,9 @@ class Model(PreTrainedModel, GenerationMixin):
         return {"input_ids": input_ids[:, -self.block_size:]}
 
     def forward(
-            self, input_ids: torch.Tensor,
+            self,
+            input_ids: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
             labels: Optional[torch.Tensor] = None,
             num_items_in_batch: Optional[int] = None,
             **kwargs
