@@ -32,7 +32,7 @@ def main(args: argparse.Namespace):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Sample from a character-level transformer")
+    parser = argparse.ArgumentParser(description="Generate text using a trained transformer model")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--data-path", type=str, default="data/tinyshakespeare.txt")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
