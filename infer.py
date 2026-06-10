@@ -4,7 +4,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig
 from transformers import pipeline, set_seed
 
 from model import Model, ModelConfig
-from data_utils import load_text_corpus, Tokenizer
+from data_utils import get_tokenizer
 
 
 def main(args: argparse.Namespace):
@@ -15,16 +15,15 @@ def main(args: argparse.Namespace):
     model.eval()
 
     # load tokenizer
-    text_cropus = load_text_corpus(args.data_path)
-    tokenizer = Tokenizer(text_cropus)
+    tokenizer = get_tokenizer()
     
     # Generate text using Hugging Face pipeline
     generation_config = GenerationConfig(
         max_new_tokens=args.max_new_tokens, temperature=args.temperature,
-        do_sample=True, pad_token_id=None, eos_token_id=None,
-        num_return_sequences=args.num_return_sequences)
+        pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id,
+        do_sample=True, num_return_sequences=args.num_return_sequences)
     generator = pipeline(
-        'text-generation', model=model, tokenizer=tokenizer, device=args.device)
+        'text-generation', model=model, tokenizer=tokenizer, clean_up_tokenization_spaces=False, device=args.device)
     outputs = generator(args.prompt, generation_config=generation_config)
     print("\n=== Generated Outputs ===")
     for idx, out in enumerate(outputs):
@@ -39,8 +38,8 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--save-dir", type=str, default="models")
     parser.add_argument("--prompt", type=str, default="\n")
-    parser.add_argument("--max-new-tokens", type=int, default=500)
-    parser.add_argument("--temperature", type=float, default=0.85)
+    parser.add_argument("--max-new-tokens", type=int, default=200)
+    parser.add_argument("--temperature", type=float, default=0.95)
     parser.add_argument("--num-return-sequences", type=int, default=3)
     args = parser.parse_args()
     set_seed(args.seed)
