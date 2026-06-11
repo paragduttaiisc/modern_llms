@@ -5,18 +5,15 @@ from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from transformers import set_seed, TrainingArguments, Trainer
 
 from model import Model, ModelConfig
-from data_utils import load_text_corpus, get_tokenizer, split_dataset
-from utils import pretty_count
+from data_utils import load_text_corpus, get_tokenizer, TextDataset
 
 
 def main(args: argparse.Namespace):
     # Prepare data
     text_cropus = load_text_corpus(args.data_path)
     tokenizer = get_tokenizer()
-    print(f"Tokenizer vocab size: {len(tokenizer)}")
     data = tokenizer(text_cropus, return_tensors="pt")["input_ids"].squeeze()
-    print(f"Dataset size: {pretty_count(len(data))} tokens")
-    train_dataset, val_dataset = split_dataset(data, args)
+    dataset = TextDataset(data, block_size=args.block_size)
 
     # create model and optimizer
     model = Model(ModelConfig(
@@ -50,9 +47,9 @@ def main(args: argparse.Namespace):
         max_steps=args.n_iters,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
-        eval_on_start=True,
-        eval_strategy="steps",
-        eval_steps=args.eval_interval,
+        # eval_on_start=True,
+        # eval_strategy="steps",
+        # eval_steps=args.eval_interval,
         save_steps=args.save_interval,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
@@ -68,8 +65,7 @@ def main(args: argparse.Namespace):
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
+        train_dataset=dataset,
         optimizers=(optimizer, scheduler) # type: ignore
     )
     trainer.train()
@@ -82,7 +78,6 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--data-path", type=str, default="data/tinyshakespeare.txt")
     parser.add_argument("--save-dir", type=str, default="models")
-    parser.add_argument("--test-size", type=float, default=0.05)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--vocab-size", type=int, default=49216)
     parser.add_argument("--batch-size", type=int, default=128)
@@ -91,13 +86,13 @@ if __name__ == "__main__":
     parser.add_argument("--n-heads", type=int, default=4)
     parser.add_argument("--n-layers", type=int, default=6)
     parser.add_argument("--dropout", type=float, default=0.2)
-    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    parser.add_argument("--n-iters", type=int, default=500)
+    parser.add_argument("--n-iters", type=int, default=3000)
     parser.add_argument("--warmup-iters", type=int, default=20)
-    parser.add_argument("--log-interval", type=int, default=10)
-    parser.add_argument("--eval-interval", type=int, default=100)
+    parser.add_argument("--log-interval", type=int, default=100)
+    # parser.add_argument("--eval-interval", type=int, default=100)
     parser.add_argument("--save-interval", type=int, default=500)
     parser.add_argument("--eval-iters", type=int, default=5)
     parser.add_argument("--use-bf16", action="store_true")
