@@ -1,10 +1,7 @@
-import argparse
 import torch
+import numpy as np
 from transformers import AutoTokenizer, PreTrainedTokenizer
-from torch.utils.data import Dataset
-from typing import Tuple
-
-from utils import train_test_split
+from torch.utils.data import IterableDataset
 
 
 def get_tokenizer(tokenizer_path: str = "tokenizer") -> PreTrainedTokenizer:
@@ -31,29 +28,27 @@ def get_tokenizer(tokenizer_path: str = "tokenizer") -> PreTrainedTokenizer:
     return tokenizer
 
 
-
-class TextDataset(Dataset):
-    def __init__(self, data: torch.Tensor, block_size: int) -> None:
-        self.data = data
+class TokenDataset(IterableDataset):
+    def __init__(self, shard_list_file: str, block_size: int) -> None:
+        # self.shard_list_file = shard_list_file
         self.block_size = block_size
-
-    def __len__(self) -> int:
-        return len(self.data) - self.block_size - 1
-
-    def __getitem__(self, idx: int) -> dict:
-        seq = self.data[idx:idx + self.block_size + 1]
-        return {"input_ids": seq[:-1].long(), "labels": seq[1:].long()}
-
-
-def load_text_corpus(data_path: str) -> str:
-    with open(data_path, 'r', encoding='utf-8') as f:
-        return f.read()
-
-
-def split_dataset(
-        data: torch.Tensor, args: argparse.Namespace
-) -> Tuple[TextDataset, TextDataset]:
-    train_data, val_data = train_test_split(data, test_size=args.test_size)
-    train_dataset = TextDataset(train_data, args.block_size)
-    val_dataset = TextDataset(val_data, args.block_size)
-    return train_dataset, val_dataset
+        with open(shard_list_file, 'r') as f:
+            self.shard_paths = [line.strip() for line in f if line.strip()]
+    
+    def __iter__(self):
+        for shard_path in self.shard_paths:
+            tokens = np.load(shard_path)
+            n_examples = (len(tokens) - 1) // self.block_size
+            for i in range(n_examples):
+                start_idx = i * self.block_size
+                end_idx = start_idx + self.block_size + 1
+                seq = tokens[start_idx:end_idx]
+                
+                input_ids = torch.from_numpy(seq[:-1].copy()).long()
+                attention_mask = torch.ones_like(input_ids)
+                labels = torch.from_numpy(seq[1:].copy()).long()
+                yield {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "labels": labels
+                }

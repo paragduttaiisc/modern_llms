@@ -1,19 +1,17 @@
 import os
 import argparse
 import torch, torch.optim as optim
-from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+from torch.optim.lr_scheduler import ConstantLR, LinearLR, CosineAnnealingLR, SequentialLR
 from transformers import set_seed, TrainingArguments, Trainer
 
 from model import Model, ModelConfig
-from data_utils import load_text_corpus, get_tokenizer, TextDataset
+from data_utils import get_tokenizer, TokenDataset
 
 
 def main(args: argparse.Namespace):
     # Prepare data
-    text_cropus = load_text_corpus(args.data_path)
     tokenizer = get_tokenizer()
-    data = tokenizer(text_cropus, return_tensors="pt")["input_ids"].squeeze()
-    dataset = TextDataset(data, block_size=args.block_size)
+    dataset = TokenDataset(args.shard_list_file, block_size=args.block_size)
 
     # create model and optimizer
     model = Model(ModelConfig(
@@ -30,16 +28,19 @@ def main(args: argparse.Namespace):
     model.generation_config.pad_token_id = tokenizer.pad_token_id
     optimizer = optim.AdamW(
         model.parameters(), lr=args.learning_rate,
-        weight_decay=args.weight_decay, betas=(0.9, 0.95))
+        weight_decay=args.weight_decay, betas=(0.9, 0.95), eps=1e-8)
     warmup_scheduler = LinearLR(
         optimizer, start_factor=1e-6, total_iters=args.warmup_iters)
     cosine_scheduler = CosineAnnealingLR(
-        optimizer, T_max=args.n_iters - args.warmup_iters,
+        optimizer, T_max=args.last_decay_iter - args.warmup_iters,
         eta_min=args.learning_rate / 10)
+    constant_scheduler = ConstantLR(
+        optimizer, factor=1.0, total_iters=args.n_iters - args.last_decay_iter)
     scheduler = SequentialLR(
-        optimizer, schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[args.warmup_iters])
-    
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler, constant_scheduler],
+        milestones=[args.warmup_iters, args.last_decay_iter])
+
     # train
     training_args = TrainingArguments(
         output_dir=args.save_dir,
@@ -50,6 +51,8 @@ def main(args: argparse.Namespace):
         # eval_on_start=True,
         # eval_strategy="steps",
         # eval_steps=args.eval_interval,
+        gradient_accumulation_steps=2,
+        save_total_limit=2,
         save_steps=args.save_interval,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
@@ -76,25 +79,26 @@ def main(args: argparse.Namespace):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a transformer")
     parser.add_argument("--seed", type=int, default=2026)
-    parser.add_argument("--data-path", type=str, default="data/tinyshakespeare.txt")
+    parser.add_argument("--shard-list-file", type=str, default="data/web_small.txt")
     parser.add_argument("--save-dir", type=str, default="models")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--vocab-size", type=int, default=49216)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--block-size", type=int, default=256)
-    parser.add_argument("--n-embed", type=int, default=384)
-    parser.add_argument("--n-heads", type=int, default=4)
-    parser.add_argument("--n-layers", type=int, default=6)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--block-size", type=int, default=1024)
+    parser.add_argument("--n-embed", type=int, default=768)
+    parser.add_argument("--n-heads", type=int, default=12)
+    parser.add_argument("--n-layers", type=int, default=12)
     parser.add_argument("--dropout", type=float, default=0.2)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
-    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    parser.add_argument("--n-iters", type=int, default=3000)
-    parser.add_argument("--warmup-iters", type=int, default=20)
+    parser.add_argument("--n-iters", type=int, default=37650)
+    parser.add_argument("--warmup-iters", type=int, default=500)
+    parser.add_argument("--last-decay-iter", type=int, default=34000)
     parser.add_argument("--log-interval", type=int, default=100)
     # parser.add_argument("--eval-interval", type=int, default=100)
-    parser.add_argument("--save-interval", type=int, default=500)
-    parser.add_argument("--eval-iters", type=int, default=5)
+    # parser.add_argument("--eval-iters", type=int, default=5)
+    parser.add_argument("--save-interval", type=int, default=1000)
     parser.add_argument("--use-bf16", action="store_true")
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--wandb-project", type=str, default="improved-transformer")
