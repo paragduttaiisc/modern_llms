@@ -10,7 +10,9 @@ from data_utils import get_tokenizer, TokenDataset
 def main(args: argparse.Namespace):
     # Prepare data
     tokenizer = get_tokenizer()
-    dataset = TokenDataset(args.shard_list_file, block_size=args.block_size)
+    trainset = TokenDataset(args.shard_list_file, block_size=args.block_size)
+    valset = TokenDataset(
+        args.shard_list_file, block_size=args.block_size, subset="val")
 
     # create model and optimizer
     model = Model(ModelConfig(
@@ -71,7 +73,8 @@ def main(args: argparse.Namespace):
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=dataset,
+        train_dataset=trainset,
+        eval_dataset=valset,
         optimizers=(optimizer, scheduler) # type: ignore
     )
     trainer.train()
@@ -82,7 +85,7 @@ def main(args: argparse.Namespace):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a transformer")
     parser.add_argument("--seed", type=int, default=2026)
-    parser.add_argument("--shard-list-file", type=str, default="data/web_small.txt")
+    parser.add_argument("--shard-list-file", type=str, default="data/web_small.json")
     parser.add_argument("--save-dir", type=str, default="models")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--vocab-size", type=int, default=49216)
