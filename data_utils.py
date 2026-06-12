@@ -1,3 +1,4 @@
+import json
 import torch
 import numpy as np
 from transformers import AutoTokenizer, PreTrainedTokenizer
@@ -29,11 +30,12 @@ def get_tokenizer(tokenizer_path: str = "tokenizer") -> PreTrainedTokenizer:
 
 
 class TokenDataset(IterableDataset):
-    def __init__(self, shard_list_file: str, block_size: int) -> None:
-        # self.shard_list_file = shard_list_file
+    def __init__(
+            self, shard_list_file: str, block_size: int, subset: str = "train"
+    ) -> None:
         self.block_size = block_size
-        with open(shard_list_file, 'r') as f:
-            self.shard_paths = [line.strip() for line in f if line.strip()]
+        data = json.load(open(shard_list_file, 'r'))
+        self.shard_paths = data[subset]
     
     def __iter__(self):
         for shard_path in self.shard_paths:
