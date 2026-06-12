@@ -23,9 +23,6 @@ def main(args: argparse.Namespace):
         num_attention_heads=args.n_heads,
         dropout=args.dropout
     ))
-    if os.path.exists("models/checkpoint-35000"):
-        print("Loading model from checkpoint...")
-        model = Model.from_pretrained("models/checkpoint-35000")
     model.config.eos_token_id = tokenizer.eos_token_id
     model.config.pad_token_id = tokenizer.pad_token_id
     model.generation_config.eos_token_id = tokenizer.eos_token_id
