@@ -4,15 +4,47 @@ from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from transformers import set_seed, TrainingArguments, Trainer
 
 from model import Model, ModelConfig
-from data_utils import get_tokenizer, TokenDataset
+from utils import get_tokenizer, TokenDataset, human_readable_numbers, get_optimizer
 
 
 def main(args: argparse.Namespace):
+    # Setup
+    os.environ["WANDB_PROJECT"] = args.wandb_project
+    os.environ["WANDB_ENTITY"] = args.wandb_entity
+    effective_tokens_target = args.effective_tokens_target
+    effective_batch_size = args.batch_size
+    if torch.cuda.is_available():
+        effective_batch_size *= torch.cuda.device_count()
+    effective_token_size = effective_batch_size * args.block_size
+    args.gradient_accumulation_steps =\
+        max(1, math.ceil(effective_tokens_target / effective_token_size))
+    is_master_process = int(os.environ.get("LOCAL_RANK", 0)) == 0
+    if is_master_process:
+        print("Targeted Effective tokens:",
+              human_readable_numbers(args.effective_tokens_target))
+        print("Num of GPUs:",
+              human_readable_numbers(torch.cuda.device_count()))
+        print("Batch size per GPU:", 
+              human_readable_numbers(args.batch_size))
+        print("Sequence length:", 
+              human_readable_numbers(args.block_size))
+        print("Total effective token size:", 
+              human_readable_numbers(effective_token_size))
+        print("Gradient accumulation steps:", 
+              human_readable_numbers(args.gradient_accumulation_steps))
+    
     # Prepare data
     tokenizer = get_tokenizer()
     trainset = TokenDataset(args.shard_list_file, block_size=args.block_size)
     valset = TokenDataset(
         args.shard_list_file, block_size=args.block_size, subset="val")
+    if is_master_process:
+        print("Tokenizer vocab size:", 
+              human_readable_numbers(tokenizer.vocab_size))
+        print("Num_tokens in trainset:", 
+              human_readable_numbers(int(len(trainset.shard_paths) * 2e7)))
+        print("Num_tokens in valset:", 
+              human_readable_numbers(int(len(valset.shard_paths) * 2e7)))
 
     # create model and optimizer
     model = Model(ModelConfig(
@@ -27,9 +59,11 @@ def main(args: argparse.Namespace):
     model.config.pad_token_id = tokenizer.pad_token_id
     model.generation_config.eos_token_id = tokenizer.eos_token_id
     model.generation_config.pad_token_id = tokenizer.pad_token_id
-    optimizer = optim.AdamW(
-        model.parameters(), lr=args.learning_rate,
-        weight_decay=args.weight_decay, betas=(0.9, 0.95), eps=1e-8)
+    if is_master_process:
+        num_params = sum(p.numel() for p in model.parameters())
+        print("Number of parameters in model:",
+              human_readable_numbers(num_params))
+    optimizer = get_optimizer(model, args)
     warmup_scheduler = LinearLR(
         optimizer, start_factor=1e-6, total_iters=args.warmup_iters)
     cosine_scheduler = CosineAnnealingLR(
@@ -50,7 +84,7 @@ def main(args: argparse.Namespace):
         max_steps=args.n_iters,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
-        eval_on_start=True,
+        # eval_on_start=True,
         eval_strategy="steps",
         eval_steps=args.eval_interval,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -74,6 +108,8 @@ def main(args: argparse.Namespace):
         eval_dataset=valset,
         optimizers=(optimizer, scheduler) # type: ignore
     )
+    if is_master_process:
+        print("Starting training...")
     trainer.train()
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
@@ -83,7 +119,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a transformer")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--shard-list-file", type=str, default="data/web_small.json")
-    parser.add_argument("--save-dir", type=str, default="models")
+    parser.add_argument("--save-dir", type=str, default="models/hf_run")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--vocab-size", type=int, default=49216)
     parser.add_argument("--block-size", type=int, default=1024)
@@ -91,12 +127,15 @@ if __name__ == "__main__":
     parser.add_argument("--n-heads", type=int, default=12)
     parser.add_argument("--n-layers", type=int, default=12)
     parser.add_argument("--dropout", type=float, default=0.2)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--betas", type=float, nargs=2, default=(0.9, 0.95))
+    parser.add_argument("--optimizer-epsilon", type=float, default=1e-8)
+    parser.add_argument("--use-fused-optimizer", type=bool, default=True)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--effective-tokens-target", type=int, default=2**19)
-    parser.add_argument("--n-iters", type=int, default=38145)
+    parser.add_argument("--n-iters", type=int, default=38068)
     parser.add_argument("--warmup-iters", type=int, default=500)
     parser.add_argument("--last-decay-iter", type=int, default=35000)
     parser.add_argument("--log-interval", type=int, default=10)
@@ -109,13 +148,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     torch.set_float32_matmul_precision('medium' if args.use_bf16 else 'high')
     set_seed(args.seed)
-    os.environ["WANDB_PROJECT"] = args.wandb_project
-    os.environ["WANDB_ENTITY"] = args.wandb_entity
-    effective_tokens_target = args.effective_tokens_target
-    effective_batch_size = args.batch_size
-    if torch.cuda.is_available():
-        effective_batch_size *= torch.cuda.device_count()
-    effective_tokens_size = effective_batch_size * args.block_size
-    args.gradient_accumulation_steps =\
-        max(1, math.ceil(effective_tokens_target / effective_tokens_size))
     main(args)
