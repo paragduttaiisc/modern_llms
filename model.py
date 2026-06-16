@@ -36,20 +36,26 @@ class MultiHeadAttention(nn.Module):
         self.num_heads = num_heads
         self.head_size = n_embed // num_heads
 
-        self.attn_mat = nn.Linear(n_embed, 3 * n_embed, bias=False)
+        self.q_proj = nn.Linear(n_embed, n_embed, bias=False)
+        self.k_proj = nn.Linear(n_embed, n_embed, bias=False)
+        self.v_proj = nn.Linear(n_embed, n_embed, bias=False)
+
         self.proj = nn.Linear(n_embed, n_embed)
         self.dropout = nn.Dropout(dropout)
 
         self.flash = hasattr(F, 'scaled_dot_product_attention')
         if not self.flash:
-            self.register_buffer('mask', torch.tril(torch.ones(block_size, block_size)))
+            self.register_buffer(
+                'mask', torch.tril(torch.ones(block_size, block_size)))
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
-        q, k, v = self.attn_mat(x).chunk(3, dim=-1)  # Each: B, T, n_embed
-        q = q.view(B, T, self.num_heads, self.head_size).transpose(1, 2)
-        k = k.view(B, T, self.num_heads, self.head_size).transpose(1, 2)
-        v = v.view(B, T, self.num_heads, self.head_size).transpose(1, 2)
+        q = self.q_proj(x)\
+            .view(B, T, self.num_heads, self.head_size).transpose(1, 2)
+        k = self.k_proj(x)\
+            .view(B, T, self.num_heads, self.head_size).transpose(1, 2)
+        v = self.v_proj(x)\
+            .view(B, T, self.num_heads, self.head_size).transpose(1, 2)
 
         if self.flash: # Flash attention using PyTorch 2.0's built-in function
             out = F.scaled_dot_product_attention(
