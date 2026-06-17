@@ -10,7 +10,7 @@ from utils import (
     TokenDataset,
     LLMTrainer,
     get_tokenizer,
-    human_readable_numbers,
+    human_readable_numbers as hrn,
 )
 
 
@@ -22,27 +22,20 @@ def main(args: argparse.Namespace):
     effective_tokens_target = args.effective_tokens_target
     effective_batch_size = args.batch_size
     if torch.cuda.is_available():
-        effective_batch_size *= torch.cuda.device_count()
+        world_size = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
+        effective_batch_size *= world_size
     effective_token_size = effective_batch_size * args.block_size
-    args.gradient_accumulation_steps =\
-        math.ceil(effective_tokens_target / effective_token_size)
     accelerator = Accelerator(
         mixed_precision="bf16" if args.use_bf16 and torch.cuda.is_available() else "no",
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        gradient_accumulation_steps=math.ceil(effective_tokens_target / effective_token_size),
     )
     if accelerator.is_main_process:
-        print("Targeted Effective tokens:",
-              human_readable_numbers(args.effective_tokens_target))
-        print("Num of GPUs:",
-              human_readable_numbers(torch.cuda.device_count()))
-        print("Batch size per GPU:", 
-              human_readable_numbers(args.batch_size))
-        print("Sequence length:", 
-              human_readable_numbers(args.block_size))
-        print("Total effective token size:", 
-              human_readable_numbers(effective_token_size))
-        print("Gradient accumulation steps:", 
-              accelerator.gradient_accumulation_steps)
+        print("Targeted Effective tokens:", hrn(args.effective_tokens_target))
+        print("Num of GPUs:", world_size)
+        print("Batch size per GPU:", args.batch_size)
+        print("Sequence length:", args.block_size)
+        print("Total effective token size:", hrn(effective_token_size))
+        print("Gradient accumulation steps:", accelerator.gradient_accumulation_steps)
     
     # Prepare data
     tokenizer = get_tokenizer()
@@ -57,12 +50,9 @@ def main(args: argparse.Namespace):
         subset="val"
     )
     if accelerator.is_main_process:
-        print("Tokenizer vocab size:", 
-              human_readable_numbers(tokenizer.vocab_size))
-        print("Num_tokens in trainset:", 
-              human_readable_numbers(int(len(trainset.shard_paths) * 2e7)))
-        print("Num_tokens in valset:", 
-              human_readable_numbers(int(len(valset.shard_paths) * 2e7)))
+        print("Tokenizer vocab size:", hrn(tokenizer.vocab_size))
+        print("Num_tokens in trainset:", hrn(int(len(trainset.shard_paths) * 2e7)))
+        print("Num_tokens in valset:", hrn(int(len(valset.shard_paths) * 2e7)))
 
     # create model and optimizer
     model = Model(ModelConfig(
@@ -79,8 +69,7 @@ def main(args: argparse.Namespace):
     model.generation_config.pad_token_id = tokenizer.pad_token_id
     if accelerator.is_main_process:
         num_params = sum(p.numel() for p in model.parameters())
-        print("Number of parameters in model:",
-              human_readable_numbers(num_params))
+        print("Number of parameters in model:", hrn(num_params))
 
     # # train
     training_args = TrainingArguments(
