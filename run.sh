@@ -2,6 +2,8 @@
 #SBATCH --job-name=gpt2_muon
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=0
 #SBATCH --gres=gpu:4
 #SBATCH --nodelist=n2
 #SBATCH --partition=normal
