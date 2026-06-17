@@ -81,7 +81,7 @@ def main(args: argparse.Namespace):
         eval_on_start=True,
         eval_strategy="steps",
         eval_steps=args.eval_interval,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        gradient_accumulation_steps=accelerator.gradient_accumulation_steps,
         save_total_limit=5,
         save_steps=args.save_interval,
         learning_rate=args.adamw_lr,
