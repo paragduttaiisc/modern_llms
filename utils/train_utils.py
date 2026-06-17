@@ -136,28 +136,9 @@ class LLMTrainer(Trainer):
             self.total_tokens += local_tokens * world_size
         return loss
     
-    def evaluate(
-            self,
-            eval_dataset: Optional[torch.utils.data.Dataset] = None,
-            ignore_keys: Optional[list] = None,
-            metric_key_prefix: str = "eval"
-    ) -> dict:
-        metrics = super().evaluate(
-            eval_dataset=eval_dataset, 
-            ignore_keys=ignore_keys, 
-            metric_key_prefix=metric_key_prefix
-        )
-        loss_key = f"{metric_key_prefix}_loss"
-        if loss_key in metrics:
-            try:
-                metrics[f"{metric_key_prefix}_perplexity"] =\
-                    math.exp(metrics[loss_key])
-            except OverflowError:
-                metrics[f"{metric_key_prefix}_perplexity"] = float("inf")
-
-        return metrics
-
     def log(self, logs: dict, *args, **kwargs) -> None:
+        logs.pop("learning_rate", None)
+
         if "loss" in logs:
             elapsed = time.time() - self.log_start_time
             if elapsed > 0:
@@ -171,6 +152,7 @@ class LLMTrainer(Trainer):
                     logs["iter_time"] = elapsed / steps_passed
                     logs["samples_per_sec"] =\
                         (tokens_passed / self.block_size) / elapsed
+            
             if self.optimizer is not None:
                 base_opt = self.optimizer
                 while hasattr(base_opt, "optimizer")\
@@ -186,9 +168,15 @@ class LLMTrainer(Trainer):
                 logs["perplexity"] = math.exp(logs["loss"])
             except OverflowError:
                 logs["perplexity"] = float("inf")            
+            
             self.log_start_time = time.time()
             self.log_start_tokens = self.total_tokens
             self.log_start_steps = self.state.global_step
-            logs.pop("learning_rate", None)
+
+        if "eval_loss" in logs:
+            try:
+                logs["eval_perplexity"] = math.exp(logs["eval_loss"])
+            except OverflowError:
+                logs["eval_perplexity"] = float("inf")
 
         super().log(logs, *args, **kwargs)
