@@ -29,6 +29,7 @@ ENV/
 data/
 models/
 outputs/
+data.tar
 
 # Logs
 logs/

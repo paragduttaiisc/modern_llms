@@ -1,3 +1,4 @@
+import os
 import math
 import torch
 import argparse
@@ -16,6 +17,8 @@ from utils import (
 def main(args: argparse.Namespace):
     # Setup
     set_seed(args.seed)
+    os.environ["WANDB_PROJECT"] = args.wandb_project
+    os.environ["WANDB_ENTITY"] = args.wandb_entity
     effective_tokens_target = args.effective_tokens_target
     effective_batch_size = args.batch_size
     if torch.cuda.is_available():
@@ -96,7 +99,7 @@ def main(args: argparse.Namespace):
         weight_decay=args.adamw_weight_decay,
         bf16=args.use_bf16 and torch.cuda.is_available(),
         logging_steps=args.log_interval,
-        report_to="wandb" if args.wandb_run_name else "none",
+        report_to="wandb" if args.wandb_run_name else "tensorboard",
         run_name=args.wandb_run_name,
         project=args.wandb_project,
         max_grad_norm=args.max_grad_norm,
@@ -125,7 +128,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a transformer")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--shard-list-file", type=str, default="data/web_small_10B.json")
-    parser.add_argument("--save-dir", type=str, default="models/hf_run")
+    parser.add_argument("--save-dir", type=str, default="outputs")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--vocab-size", type=int, default=49216)
     parser.add_argument("--block-size", type=int, default=1024)
