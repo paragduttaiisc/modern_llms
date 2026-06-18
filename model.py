@@ -2,8 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PreTrainedConfig, PreTrainedModel, GenerationMixin
-from transformers.modeling_outputs import CausalLMOutput
-from typing import Optional
+from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.cache_utils import Cache, DynamicCache
+from typing import Optional, Union
 
 
 class ModelConfig(PreTrainedConfig):
@@ -30,7 +31,11 @@ class ModelConfig(PreTrainedConfig):
 
 class MultiHeadAttention(nn.Module):
     def __init__(
-            self, num_heads: int, n_embed: int, block_size: int, dropout: float
+            self,
+            num_heads: int,
+            n_embed: int,
+            block_size: int,
+            dropout: float,
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
@@ -48,31 +53,45 @@ class MultiHeadAttention(nn.Module):
             self.register_buffer(
                 'mask', torch.tril(torch.ones(block_size, block_size)))
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+            self,
+            x: torch.Tensor,
+            past_key_values: Optional[Cache] = None,
+            layer_idx: Optional[int] = None,
+    ) -> torch.Tensor:
         B, T, C = x.shape
-        q = self.q_proj(x)\
-            .view(B, T, self.num_heads, self.head_size).transpose(1, 2)
-        k = self.k_proj(x)\
-            .view(B, T, self.num_heads, self.head_size).transpose(1, 2)
-        v = self.v_proj(x)\
-            .view(B, T, self.num_heads, self.head_size).transpose(1, 2)
+        q = self.q_proj(x).view(B, T, self.num_heads, self.head_size).transpose(1, 2)
+        k = self.k_proj(x).view(B, T, self.num_heads, self.head_size).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.num_heads, self.head_size).transpose(1, 2)
 
-        if self.flash: # Flash attention using PyTorch 2.0's built-in function
+        if past_key_values is not None:
+            k, v = past_key_values.update(k, v, layer_idx) # type: ignore
+
+        if self.flash: 
+            is_causal = (T > 1) 
             out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=None, is_causal=True,
+                q, k, v, attn_mask=None, is_causal=is_causal,
                 dropout_p=self.dropout.p if self.training else 0.0)
-        else: # Fallback to manual SDPA implementation
+        else: 
             att = q @ k.transpose(-2, -1) * (self.head_size ** -0.5)
-            att = att.masked_fill(self.mask[:T, :T] == 0, float('-inf')) # type: ignore
+            if T > 1:
+                T_k = k.shape[-2]
+                causal_mask = self.mask[T_k - T:T_k, :T_k] # type: ignore
+                att = att.masked_fill(causal_mask == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.dropout(att)
             out = att @ v
+            
         out = out.transpose(1, 2).contiguous().view(B, T, C)
-        return self.dropout(self.proj(out))  # B, T, n_embed
+        return self.dropout(self.proj(out))
 
 
 class FeedForward(nn.Module):
-    def __init__(self, n_embed: int, dropout: float) -> None:
+    def __init__(
+            self,
+            n_embed: int,
+            dropout: float,
+    ) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_embed, 4 * n_embed),
@@ -81,13 +100,20 @@ class FeedForward(nn.Module):
             nn.Dropout(dropout)
         )
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+            self,
+            x: torch.Tensor,
+    ) -> torch.Tensor:
         return self.net(x)
 
 
 class Block(nn.Module):
     def __init__(
-            self, n_embed: int, num_heads: int, block_size: int, dropout: float
+            self,
+            n_embed: int,
+            num_heads: int,
+            block_size: int,
+            dropout: float,
     ) -> None:
         super().__init__()
         self.sa_heads = MultiHeadAttention(
@@ -96,10 +122,16 @@ class Block(nn.Module):
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.sa_heads(self.ln1(x))
+    def forward(
+            self,
+            x: torch.Tensor,
+            past_key_values: Optional[Cache] = None,
+            layer_idx: Optional[int] = None,
+    ) -> torch.Tensor:
+        attn_out = self.sa_heads(self.ln1(x), past_key_values, layer_idx)
+        x = x + attn_out
         x = x + self.ffwd(self.ln2(x))
-        return x
+        return x 
 
 
 class Model(PreTrainedModel, GenerationMixin):
@@ -107,7 +139,10 @@ class Model(PreTrainedModel, GenerationMixin):
     base_model_prefix = "modern_transformer"
     _tied_weights_keys = {"lm_head.weight": "tok_emb_table.weight"}
 
-    def __init__(self, config) -> None:
+    def __init__(
+            self,
+            config: ModelConfig,
+    ) -> None:
         super().__init__(config)
         self.tok_emb_table = nn.Embedding(config.vocab_size, config.hidden_size)
         self.pos_emb_table = nn.Embedding(config.block_size, config.hidden_size)
@@ -137,34 +172,94 @@ class Model(PreTrainedModel, GenerationMixin):
     def set_output_embeddings(self, value: nn.Linear) -> None:
         self.lm_head = value
 
-    def prepare_inputs_for_generation(self, input_ids, **kwargs):
-        return {"input_ids": input_ids[:, -self.block_size:]}
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: torch.Tensor,
+        past_key_values: Optional[Cache] = None,
+        **kwargs
+    ):
+        past_length = 0
+
+        if past_key_values is not None:
+            past_length = past_key_values.get_seq_length()
+
+        if past_length > 0:
+            input_ids = input_ids[:, -1:]
+        else:
+            input_ids = input_ids[:, -self.block_size:]
+
+        return {
+            "input_ids": input_ids,
+            "past_key_values": past_key_values,
+            "use_cache": kwargs.get("use_cache", True),
+        }
 
     def forward(
-            self,
-            input_ids: torch.Tensor,
-            attention_mask: Optional[torch.Tensor] = None,
-            labels: Optional[torch.Tensor] = None,
-            num_items_in_batch: Optional[int] = None,
-            **kwargs
-    ) -> CausalLMOutput:
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        num_items_in_batch: Optional[int] = None,
+        past_key_values: Optional[Cache] = None,
+        use_cache: Optional[bool] = None,
+        **kwargs,
+    ) -> CausalLMOutputWithPast:
+
+        use_cache = (
+            use_cache
+            if use_cache is not None
+            else getattr(self.config, "use_cache", True)
+        )
+
         _, T = input_ids.shape
+
+        past_length = 0
+        if past_key_values is not None:
+            past_length = past_key_values.get_seq_length()
+
+        positions = torch.arange(
+            past_length,
+            past_length + T,
+            device=input_ids.device,
+        )
+
         tok_embs = self.tok_emb_table(input_ids)
-        pos_embs = self.pos_emb_table(torch.arange(T, device=input_ids.device))
+        pos_embs = self.pos_emb_table(positions)
+
         x = self.emb_drop(tok_embs + pos_embs)
-        for layer in self.layers:
-            x = layer(x)
-        logits = self.lm_head(self.ln_f(x))
+
+        for i, layer in enumerate(self.layers):
+            x = layer(
+                x,
+                past_key_values=past_key_values if use_cache else None,
+                layer_idx=i,
+            )
+
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
 
         if labels is None:
             loss = None
         else:
             _, _, C = logits.shape
+
+            reduction = (
+                "sum"
+                if num_items_in_batch is not None
+                else "mean"
+            )
+
+            loss = F.cross_entropy(
+                logits.view(-1, C),
+                labels.view(-1),
+                reduction=reduction,
+            )
+
             if num_items_in_batch is not None:
-                loss = F.cross_entropy(
-                    logits.view(-1, C), labels.view(-1), reduction="sum")
                 loss = loss / num_items_in_batch
-            else:
-                loss = F.cross_entropy(
-                    logits.view(-1, C), labels.view(-1), reduction="mean")
-        return CausalLMOutput(logits=logits, loss=loss)  # type: ignore
+
+        return CausalLMOutputWithPast(
+            logits=logits,
+            loss=loss, # type: ignore
+            past_key_values=past_key_values if use_cache else None,
+        )
