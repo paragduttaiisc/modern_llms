@@ -75,6 +75,7 @@ def main(args: argparse.Namespace):
     training_args = TrainingArguments(
         output_dir=args.save_dir,
         torch_compile=True,
+        use_cache=False,
         max_steps=args.n_iters,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
