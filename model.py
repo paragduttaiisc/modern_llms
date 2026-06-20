@@ -126,8 +126,8 @@ class Block(nn.Module):
         self.sa_heads = MultiHeadAttention(
             num_heads, n_embed, block_size, dropout)
         self.ffwd = FeedForward(n_embed, dropout)
-        self.ln1 = nn.LayerNorm(n_embed)
-        self.ln2 = nn.LayerNorm(n_embed)
+        self.rms_norm1 = nn.RMSNorm(n_embed, eps=1e-6)
+        self.rms_norm2 = nn.RMSNorm(n_embed, eps=1e-6)
     
     def forward(
             self,
@@ -136,9 +136,9 @@ class Block(nn.Module):
             past_key_values: Optional[Cache] = None,
             layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
-        attn_out = self.sa_heads(self.ln1(x), rotary_emb, past_key_values, layer_idx)
+        attn_out = self.sa_heads(self.rms_norm1(x), rotary_emb, past_key_values, layer_idx)
         x = x + attn_out
-        x = x + self.ffwd(self.ln2(x))
+        x = x + self.ffwd(self.rms_norm2(x))
         return x 
 
 
@@ -156,14 +156,13 @@ class Model(PreTrainedModel, GenerationMixin):
         self.emb_drop = nn.Dropout(config.dropout)
         self.head_dim = config.hidden_size // config.num_attention_heads
         self.rotary_emb = RotaryEmbedding(dim=self.head_dim)
-        # self.rotary_emb = InterleavedRotaryEmbedding(dim=head_dim, max_position_embeddings=config.block_size)
         self.layers = nn.ModuleList([
             Block(
                 config.hidden_size, config.num_attention_heads,
                 config.block_size, config.dropout
             ) for _ in range(config.num_hidden_layers)
         ])
-        self.ln_f = nn.LayerNorm(config.hidden_size)
+        self.rms_norm_f = nn.RMSNorm(config.hidden_size, eps=1e-6)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size)
         self.block_size = config.block_size
         
@@ -231,7 +230,7 @@ class Model(PreTrainedModel, GenerationMixin):
                 layer_idx=i,
             )
 
-        x = self.ln_f(x)
+        x = self.rms_norm_f(x)
         logits = self.lm_head(x)
 
         if labels is None:
