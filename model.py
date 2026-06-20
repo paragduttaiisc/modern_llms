@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -42,9 +43,7 @@ class MultiHeadAttention(nn.Module):
         self.num_heads = num_heads
         self.head_size = n_embed // num_heads
 
-        self.q_proj = nn.Linear(n_embed, n_embed, bias=False)
-        self.k_proj = nn.Linear(n_embed, n_embed, bias=False)
-        self.v_proj = nn.Linear(n_embed, n_embed, bias=False)
+        self.attn_matrix = nn.Linear(n_embed, 3 * n_embed, bias=False)
 
         self.proj = nn.Linear(n_embed, n_embed)
         self.dropout = nn.Dropout(dropout)
@@ -62,11 +61,14 @@ class MultiHeadAttention(nn.Module):
             layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
         B, T, C = x.shape
-        q = self.q_proj(x).view(B, T, self.num_heads, self.head_size).transpose(1, 2)
-        k = self.k_proj(x).view(B, T, self.num_heads, self.head_size).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, self.num_heads, self.head_size).transpose(1, 2)
+        qkv = self.attn_matrix(x)
+        q, k, v = qkv.split(self.head_size, dim=-1)
+        q = q.view(B, T, self.num_heads, self.head_size).transpose(1, 2)
+        k = k.view(B, T, self.num_heads, self.head_size).transpose(1, 2)
+        v = v.view(B, T, self.num_heads, self.head_size).transpose(1, 2)
 
-        past_length = past_key_values.get_seq_length() if past_key_values is not None else 0
+        past_length = past_key_values.get_seq_length()\
+                        if past_key_values is not None else 0
 
         q = rotary_emb.rotate_queries_or_keys(q, offset=past_length)
         k = rotary_emb.rotate_queries_or_keys(k, offset=past_length)
@@ -136,7 +138,8 @@ class Block(nn.Module):
             past_key_values: Optional[Cache] = None,
             layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
-        attn_out = self.sa_heads(self.rms_norm1(x), rotary_emb, past_key_values, layer_idx)
+        attn_out = self.sa_heads(
+            self.rms_norm1(x), rotary_emb, past_key_values, layer_idx)
         x = x + attn_out
         x = x + self.ffwd(self.rms_norm2(x))
         return x 
@@ -168,6 +171,18 @@ class Model(PreTrainedModel, GenerationMixin):
         
         self.config.tie_word_embeddings = True
         self.post_init()
+        import sys; sys.exit()
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_normal_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(
+                mean=0.0, std=1.0 / math.sqrt(module.embedding_dim))
+        elif isinstance(module, nn.RMSNorm):
+            nn.init.ones_(module.weight)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.tok_emb_table
@@ -238,17 +253,9 @@ class Model(PreTrainedModel, GenerationMixin):
         else:
             _, _, C = logits.shape
 
-            reduction = (
-                "sum"
-                if num_items_in_batch is not None
-                else "mean"
-            )
-
+            reduction = "sum" if num_items_in_batch is not None else "mean"
             loss = F.cross_entropy(
-                logits.view(-1, C),
-                labels.view(-1),
-                reduction=reduction,
-            )
+                logits.view(-1, C), labels.view(-1), reduction=reduction)
 
             if num_items_in_batch is not None:
                 loss = loss / num_items_in_batch
