@@ -95,25 +95,20 @@ class MultiHeadAttention(nn.Module):
         return self.dropout(self.proj(out))
 
 
-class FeedForward(nn.Module):
-    def __init__(
-            self,
-            n_embed: int,
-            dropout: float,
-    ) -> None:
+class FeedForward(nn.Module): # SwiGLU
+    def __init__(self, n_embed: int, dropout: float):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_embed, 4 * n_embed),
-            nn.GELU(),
-            nn.Linear(4 * n_embed, n_embed),
-            nn.Dropout(dropout)
-        )
-    
-    def forward(
-            self,
-            x: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.net(x)
+        hidden_size = 8 * n_embed // 3
+        hidden_size = 256 * ((hidden_size + 255) // 256) # for efficiency
+        self.gate_proj = nn.Linear(n_embed, hidden_size, bias=False)
+        self.up_proj = nn.Linear(n_embed, hidden_size, bias=False)
+        self.down_proj = nn.Linear(hidden_size, n_embed, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        x = F.silu(self.gate_proj(x)) * self.up_proj(x)
+        x = self.down_proj(x)
+        return self.dropout(x)
 
 
 class Block(nn.Module):
@@ -138,8 +133,8 @@ class Block(nn.Module):
             past_key_values: Optional[Cache] = None,
             layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
-        attn_out = self.sa_heads(
-            self.rms_norm1(x), rotary_emb, past_key_values, layer_idx)
+        x = self.rms_norm1(x)
+        attn_out = self.sa_heads(x, rotary_emb, past_key_values, layer_idx)
         x = x + attn_out
         x = x + self.ffwd(self.rms_norm2(x))
         return x 
