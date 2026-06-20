@@ -136,8 +136,8 @@ class Block(nn.Module):
             past_key_values: Optional[Cache] = None,
             layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
-        x = self.rms_norm1(x)
-        x = x + self.sa_heads(x, rotary_emb, past_key_values, layer_idx)
+        x = x + self.sa_heads(
+            self.rms_norm1(x), rotary_emb, past_key_values, layer_idx)
         x = x + self.ffwd(self.rms_norm2(x))
         return x 
 
