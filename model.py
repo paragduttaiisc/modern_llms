@@ -43,7 +43,9 @@ class MultiHeadAttention(nn.Module):
         self.num_heads = num_heads
         self.head_size = n_embed // num_heads
 
-        self.attn_matrix = nn.Linear(n_embed, 3 * n_embed, bias=False)
+        self.q_proj = nn.Linear(n_embed, n_embed, bias=False)
+        self.k_proj = nn.Linear(n_embed, n_embed, bias=False)
+        self.v_proj = nn.Linear(n_embed, n_embed, bias=False)
 
         self.proj = nn.Linear(n_embed, n_embed)
         self.dropout = nn.Dropout(dropout)
@@ -61,11 +63,12 @@ class MultiHeadAttention(nn.Module):
             layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
         B, T, C = x.shape
-        qkv = self.attn_matrix(x)
-        q, k, v = qkv.split(self.head_size, dim=-1)
-        q = q.view(B, T, self.num_heads, self.head_size).transpose(1, 2)
-        k = k.view(B, T, self.num_heads, self.head_size).transpose(1, 2)
-        v = v.view(B, T, self.num_heads, self.head_size).transpose(1, 2)
+        q = self.q_proj(x).view(
+            B, T, self.num_heads, self.head_size).transpose(1, 2)
+        k = self.k_proj(x).view(
+            B, T, self.num_heads, self.head_size).transpose(1, 2)
+        v = self.v_proj(x).view(
+            B, T, self.num_heads, self.head_size).transpose(1, 2)
 
         past_length = past_key_values.get_seq_length()\
                         if past_key_values is not None else 0
