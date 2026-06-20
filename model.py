@@ -3,8 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PreTrainedConfig, PreTrainedModel, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers.cache_utils import Cache, DynamicCache
-from typing import Optional, Union
+from transformers.cache_utils import Cache
+from rotary_embedding_torch import RotaryEmbedding
+from typing import Optional
 
 
 class ModelConfig(PreTrainedConfig):
@@ -56,6 +57,9 @@ class MultiHeadAttention(nn.Module):
     def forward(
             self,
             x: torch.Tensor,
+            rotary_emb: RotaryEmbedding,
+            # cos: torch.Tensor,
+            # sin: torch.Tensor,
             past_key_values: Optional[Cache] = None,
             layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
@@ -64,8 +68,16 @@ class MultiHeadAttention(nn.Module):
         k = self.k_proj(x).view(B, T, self.num_heads, self.head_size).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.num_heads, self.head_size).transpose(1, 2)
 
+        # q = (q * cos) + (rotate_half(q) * sin)
+        # k = (k * cos) + (rotate_half(k) * sin)
+        # q, k = apply_rotary_pos_emb_online(q, k, position_ids=torch.arange(T, device=x.device)) # type: ignore
+
         if past_key_values is not None:
+            q, k = rotary_emb.rotate_queries_with_cached_keys(q, k)
             k, v = past_key_values.update(k, v, layer_idx) # type: ignore
+        else:
+            q = rotary_emb.rotate_queries_or_keys(q)
+            k = rotary_emb.rotate_queries_or_keys(k)
 
         if self.flash: 
             is_causal = (T > 1) 
@@ -125,10 +137,14 @@ class Block(nn.Module):
     def forward(
             self,
             x: torch.Tensor,
+            rotary_emb: RotaryEmbedding,
+            # cos: torch.Tensor,
+            # sin: torch.Tensor,
             past_key_values: Optional[Cache] = None,
             layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
-        attn_out = self.sa_heads(self.ln1(x), past_key_values, layer_idx)
+        # attn_out = self.sa_heads(self.ln1(x), cos, sin, past_key_values, layer_idx)
+        attn_out = self.sa_heads(self.ln1(x), rotary_emb, past_key_values, layer_idx)
         x = x + attn_out
         x = x + self.ffwd(self.ln2(x))
         return x 
@@ -145,8 +161,10 @@ class Model(PreTrainedModel, GenerationMixin):
     ) -> None:
         super().__init__(config)
         self.tok_emb_table = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.pos_emb_table = nn.Embedding(config.block_size, config.hidden_size)
         self.emb_drop = nn.Dropout(config.dropout)
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.rotary_emb = RotaryEmbedding(dim=self.head_dim)
+        # self.rotary_emb = InterleavedRotaryEmbedding(dim=head_dim, max_position_embeddings=config.block_size)
         self.layers = nn.ModuleList([
             Block(
                 config.hidden_size, config.num_attention_heads,
@@ -211,26 +229,31 @@ class Model(PreTrainedModel, GenerationMixin):
             else getattr(self.config, "use_cache", True)
         )
 
-        _, T = input_ids.shape
+        B, T = input_ids.shape
 
         past_length = 0
         if past_key_values is not None:
             past_length = past_key_values.get_seq_length()
 
-        positions = torch.arange(
-            past_length,
-            past_length + T,
-            device=input_ids.device,
-        )
+        # positions = torch.arange(
+        #     past_length,
+        #     past_length + T,
+        #     device=input_ids.device,
+        # )
+        # position_ids = positions.unsqueeze(0).expand(B, -1)
 
-        tok_embs = self.tok_emb_table(input_ids)
-        pos_embs = self.pos_emb_table(positions)
+        # total_seq_len = past_length + T
+        # global_cos, global_sin = self.rotary_emb(x=input_ids, seq_len=total_seq_len)
 
-        x = self.emb_drop(tok_embs + pos_embs)
+        # cos = global_cos[position_ids].unsqueeze(1)
+        # sin = global_sin[position_ids].unsqueeze(1)
+
+        x = self.emb_drop(self.tok_emb_table(input_ids))
 
         for i, layer in enumerate(self.layers):
             x = layer(
                 x,
+                self.rotary_emb,
                 past_key_values=past_key_values if use_cache else None,
                 layer_idx=i,
             )
