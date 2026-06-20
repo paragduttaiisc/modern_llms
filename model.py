@@ -134,8 +134,7 @@ class Block(nn.Module):
             layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
         x = self.rms_norm1(x)
-        attn_out = self.sa_heads(x, rotary_emb, past_key_values, layer_idx)
-        x = x + attn_out
+        x = x + self.sa_heads(x, rotary_emb, past_key_values, layer_idx)
         x = x + self.ffwd(self.rms_norm2(x))
         return x 
 
@@ -166,7 +165,6 @@ class Model(PreTrainedModel, GenerationMixin):
         
         self.config.tie_word_embeddings = True
         self.post_init()
-        import sys; sys.exit()
     
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
