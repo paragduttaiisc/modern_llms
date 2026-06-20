@@ -58,8 +58,6 @@ class MultiHeadAttention(nn.Module):
             self,
             x: torch.Tensor,
             rotary_emb: RotaryEmbedding,
-            # cos: torch.Tensor,
-            # sin: torch.Tensor,
             past_key_values: Optional[Cache] = None,
             layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
@@ -68,16 +66,13 @@ class MultiHeadAttention(nn.Module):
         k = self.k_proj(x).view(B, T, self.num_heads, self.head_size).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.num_heads, self.head_size).transpose(1, 2)
 
-        # q = (q * cos) + (rotate_half(q) * sin)
-        # k = (k * cos) + (rotate_half(k) * sin)
-        # q, k = apply_rotary_pos_emb_online(q, k, position_ids=torch.arange(T, device=x.device)) # type: ignore
+        past_length = past_key_values.get_seq_length() if past_key_values is not None else 0
+
+        q = rotary_emb.rotate_queries_or_keys(q, offset=past_length)
+        k = rotary_emb.rotate_queries_or_keys(k, offset=past_length)
 
         if past_key_values is not None:
-            q, k = rotary_emb.rotate_queries_with_cached_keys(q, k)
             k, v = past_key_values.update(k, v, layer_idx) # type: ignore
-        else:
-            q = rotary_emb.rotate_queries_or_keys(q)
-            k = rotary_emb.rotate_queries_or_keys(k)
 
         if self.flash: 
             is_causal = (T > 1) 
@@ -138,12 +133,9 @@ class Block(nn.Module):
             self,
             x: torch.Tensor,
             rotary_emb: RotaryEmbedding,
-            # cos: torch.Tensor,
-            # sin: torch.Tensor,
             past_key_values: Optional[Cache] = None,
             layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
-        # attn_out = self.sa_heads(self.ln1(x), cos, sin, past_key_values, layer_idx)
         attn_out = self.sa_heads(self.ln1(x), rotary_emb, past_key_values, layer_idx)
         x = x + attn_out
         x = x + self.ffwd(self.ln2(x))
@@ -228,25 +220,6 @@ class Model(PreTrainedModel, GenerationMixin):
             if use_cache is not None
             else getattr(self.config, "use_cache", True)
         )
-
-        B, T = input_ids.shape
-
-        past_length = 0
-        if past_key_values is not None:
-            past_length = past_key_values.get_seq_length()
-
-        # positions = torch.arange(
-        #     past_length,
-        #     past_length + T,
-        #     device=input_ids.device,
-        # )
-        # position_ids = positions.unsqueeze(0).expand(B, -1)
-
-        # total_seq_len = past_length + T
-        # global_cos, global_sin = self.rotary_emb(x=input_ids, seq_len=total_seq_len)
-
-        # cos = global_cos[position_ids].unsqueeze(1)
-        # sin = global_sin[position_ids].unsqueeze(1)
 
         x = self.emb_drop(self.tok_emb_table(input_ids))
 
