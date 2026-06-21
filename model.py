@@ -19,6 +19,7 @@ class ModelConfig(PreTrainedConfig):
             hidden_size: int = 384,
             num_hidden_layers: int = 6,
             num_attention_heads: int = 4,
+            non_linearity: str = "GELU",
             dropout: float = 0.2,
             **kwargs
     ) -> None:
@@ -26,6 +27,7 @@ class ModelConfig(PreTrainedConfig):
         self.vocab_size = vocab_size
         self.block_size = block_size
         self.dropout = dropout
+        self.non_linearity = non_linearity
         self.num_hidden_layers = num_hidden_layers
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
@@ -98,18 +100,30 @@ class MultiHeadAttention(nn.Module):
         return self.dropout(self.proj(out))
 
 
-class FeedForward(nn.Module): # SwiGLU
-    def __init__(self, n_embed: int, dropout: float):
+class FeedForward(nn.Module):
+    def __init__(self, n_embed: int, activation: str, dropout: float):
         super().__init__()
-        hidden_size = 8 * n_embed // 3
-        hidden_size = 256 * ((hidden_size + 255) // 256) # for efficiency
-        self.gate_proj = nn.Linear(n_embed, hidden_size, bias=False)
+        assert activation in ["GELU", "SwiGLU", "SqReLU"], "Unsupported activation"
+        hidden_size = 4 * n_embed
+        self.act = nn.GELU(approximate="tanh") if activation == "GELU"\
+                    else lambda x: F.relu(x).square()
+        self.forward = self._forward_standard
+        if activation == "SwiGLU":
+            hidden_size = 8 * n_embed // 3
+            hidden_size = 256 * ((hidden_size + 255) // 256) # for efficiency
+            self.gate_proj = nn.Linear(n_embed, hidden_size, bias=False)
+            self.forward = self._forward_SwiGLU
         self.up_proj = nn.Linear(n_embed, hidden_size, bias=False)
         self.down_proj = nn.Linear(hidden_size, n_embed, bias=False)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
+    def _forward_SwiGLU(self, x):
         x = F.silu(self.gate_proj(x)) * self.up_proj(x)
+        x = self.down_proj(x)
+        return self.dropout(x)
+
+    def _forward_standard(self, x):
+        x = self.act(self.up_proj(x))
         x = self.down_proj(x)
         return self.dropout(x)
 
@@ -120,12 +134,13 @@ class Block(nn.Module):
             n_embed: int,
             num_heads: int,
             block_size: int,
+            activation: str,
             dropout: float,
     ) -> None:
         super().__init__()
         self.sa_heads = MultiHeadAttention(
             num_heads, n_embed, block_size, dropout)
-        self.ffwd = FeedForward(n_embed, dropout)
+        self.ffwd = FeedForward(n_embed, activation, dropout)
         self.rms_norm1 = nn.RMSNorm(n_embed, eps=1e-6)
         self.rms_norm2 = nn.RMSNorm(n_embed, eps=1e-6)
     
@@ -159,7 +174,7 @@ class Model(PreTrainedModel, GenerationMixin):
         self.layers = nn.ModuleList([
             Block(
                 config.hidden_size, config.num_attention_heads,
-                config.block_size, config.dropout
+                config.block_size, config.non_linearity, config.dropout
             ) for _ in range(config.num_hidden_layers)
         ])
         self.rms_norm_f = nn.RMSNorm(config.hidden_size, eps=1e-6)

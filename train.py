@@ -62,6 +62,7 @@ def main(args: argparse.Namespace):
         hidden_size=args.n_embed,
         num_hidden_layers=args.n_layers,
         num_attention_heads=args.n_heads,
+        non_linearity=args.non_linearity,
         dropout=args.dropout
     ))
     model.config.eos_token_id = tokenizer.eos_token_id
@@ -127,6 +128,7 @@ if __name__ == "__main__":
     parser.add_argument("--n-embed", type=int, default=768)
     parser.add_argument("--n-heads", type=int, default=12)
     parser.add_argument("--n-layers", type=int, default=12)
+    parser.add_argument("--non-linearity", type=str, default="SwiGLU", choices=["GELU", "SwiGLU", "SqReLU"])
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--adamw-lr", type=float, default=1e-3)
     parser.add_argument("--adamw-weight-decay", type=float, default=0.1)
