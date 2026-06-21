@@ -132,6 +132,7 @@ if __name__ == "__main__":
     parser.add_argument("--block-size", type=int, default=2048)
     parser.add_argument("--n-embed", type=int, default=768)
     parser.add_argument("--n-heads", type=int, default=12)
+    parser.add_argument("--n-kv-heads", type=int, default=4)
     parser.add_argument("--n-layers", type=int, default=12)
     parser.add_argument("--non-linearity", type=str, default="SwiGLU", choices=["GELU", "SwiGLU", "SqReLU"])
     parser.add_argument("--grad-accum-steps", type=int, default=-1)
