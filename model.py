@@ -169,17 +169,6 @@ class Model(PreTrainedModel, GenerationMixin):
         self.config.tie_word_embeddings = True
         self.post_init()
     
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            nn.init.xavier_normal_(module.weight)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(
-                mean=0.0, std=1.0 / math.sqrt(module.embedding_dim))
-        elif isinstance(module, nn.RMSNorm):
-            nn.init.ones_(module.weight)
-
     def get_input_embeddings(self) -> nn.Embedding:
         return self.tok_emb_table
 
@@ -252,7 +241,6 @@ class Model(PreTrainedModel, GenerationMixin):
             reduction = "sum" if num_items_in_batch is not None else "mean"
             loss = F.cross_entropy(
                 logits.view(-1, C), labels.view(-1), reduction=reduction)
-
             if num_items_in_batch is not None:
                 loss = loss / num_items_in_batch
 
