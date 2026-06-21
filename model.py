@@ -19,6 +19,7 @@ class ModelConfig(PreTrainedConfig):
             hidden_size: int = 384,
             num_hidden_layers: int = 6,
             num_attention_heads: int = 4,
+            num_kv_heads: Optional[int] = None,
             non_linearity: str = "GELU",
             dropout: float = 0.2,
             **kwargs
@@ -31,23 +32,32 @@ class ModelConfig(PreTrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
+        self.num_kv_heads = num_attention_heads if num_kv_heads is not None\
+                                else num_attention_heads
 
-
-class MultiQueryAttention(nn.Module):
+class GroupedQueryAttention(nn.Module):
     def __init__(
             self,
             num_heads: int,
+            num_kv_heads: int,
             n_embed: int,
             block_size: int,
             dropout: float,
     ) -> None:
         super().__init__()
+        assert num_heads % num_kv_heads == 0,\
+            "num_heads must be divisible by num_kv_heads"
+
         self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.n_repeat = num_heads // num_kv_heads
         self.head_size = n_embed // num_heads
 
         self.q_proj = nn.Linear(n_embed, n_embed, bias=False)
-        self.k_proj = nn.Linear(n_embed, self.head_size, bias=False)
-        self.v_proj = nn.Linear(n_embed, self.head_size, bias=False)
+        self.k_proj = nn.Linear(
+            n_embed, self.head_size * self.num_kv_heads, bias=False)
+        self.v_proj = nn.Linear(
+            n_embed, self.head_size * self.num_kv_heads, bias=False)
 
         self.proj = nn.Linear(n_embed, n_embed)
         self.dropout = nn.Dropout(dropout)
@@ -56,6 +66,13 @@ class MultiQueryAttention(nn.Module):
         if not self.flash:
             self.register_buffer(
                 'mask', torch.tril(torch.ones(block_size, block_size)))
+    
+    def _repeat_kv(self, x: torch.Tensor) -> torch.Tensor:
+        if self.n_repeat == 1:
+            return x
+        B, H, T, C = x.shape
+        x = x.unsqueeze(2).expand(B, H, self.n_repeat, T, C)
+        return x.reshape(B, H * self.n_repeat, T, C)
     
     def forward(
             self,
@@ -68,9 +85,9 @@ class MultiQueryAttention(nn.Module):
         q = self.q_proj(x).view(
             B, T, self.num_heads, self.head_size).transpose(1, 2)
         k = self.k_proj(x).view(
-            B, T, 1, self.head_size).transpose(1, 2)
+            B, T, self.num_kv_heads, self.head_size).transpose(1, 2)
         v = self.v_proj(x).view(
-            B, T, 1, self.head_size).transpose(1, 2)
+            B, T, self.num_kv_heads, self.head_size).transpose(1, 2)
 
         past_length = past_key_values.get_seq_length()\
                         if past_key_values is not None else 0
@@ -80,6 +97,8 @@ class MultiQueryAttention(nn.Module):
 
         if past_key_values is not None:
             k, v = past_key_values.update(k, v, layer_idx) # type: ignore
+        
+        k, v = self._repeat_kv(k), self._repeat_kv(v)
 
         if self.flash: 
             is_causal = (T > 1) 
@@ -133,13 +152,14 @@ class Block(nn.Module):
             self,
             n_embed: int,
             num_heads: int,
+            num_kv_heads: int,
             block_size: int,
             activation: str,
             dropout: float,
     ) -> None:
         super().__init__()
-        self.sa_heads = MultiQueryAttention(
-            num_heads, n_embed, block_size, dropout)
+        self.sa_heads = GroupedQueryAttention(
+            num_heads, num_kv_heads, n_embed, block_size, dropout)
         self.ffwd = FeedForward(n_embed, activation, dropout)
         self.rms_norm1 = nn.RMSNorm(n_embed, eps=1e-6)
         self.rms_norm2 = nn.RMSNorm(n_embed, eps=1e-6)
@@ -174,7 +194,8 @@ class Model(PreTrainedModel, GenerationMixin):
         self.layers = nn.ModuleList([
             Block(
                 config.hidden_size, config.num_attention_heads,
-                config.block_size, config.non_linearity, config.dropout
+                config.num_kv_heads, config.block_size,
+                config.non_linearity, config.dropout
             ) for _ in range(config.num_hidden_layers)
         ])
         self.rms_norm_f = nn.RMSNorm(config.hidden_size, eps=1e-6)
