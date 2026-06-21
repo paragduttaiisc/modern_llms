@@ -65,6 +65,7 @@ def main(args: argparse.Namespace):
         hidden_size=args.n_embed,
         num_hidden_layers=args.n_layers,
         num_attention_heads=args.n_heads,
+        num_kv_heads=args.n_kv_heads,
         non_linearity=args.non_linearity,
         dropout=args.dropout
     ))
