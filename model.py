@@ -33,7 +33,7 @@ class ModelConfig(PreTrainedConfig):
         self.num_attention_heads = num_attention_heads
 
 
-class MultiHeadAttention(nn.Module):
+class MultiQueryAttention(nn.Module):
     def __init__(
             self,
             num_heads: int,
@@ -46,8 +46,8 @@ class MultiHeadAttention(nn.Module):
         self.head_size = n_embed // num_heads
 
         self.q_proj = nn.Linear(n_embed, n_embed, bias=False)
-        self.k_proj = nn.Linear(n_embed, n_embed, bias=False)
-        self.v_proj = nn.Linear(n_embed, n_embed, bias=False)
+        self.k_proj = nn.Linear(n_embed, self.head_size, bias=False)
+        self.v_proj = nn.Linear(n_embed, self.head_size, bias=False)
 
         self.proj = nn.Linear(n_embed, n_embed)
         self.dropout = nn.Dropout(dropout)
@@ -68,9 +68,9 @@ class MultiHeadAttention(nn.Module):
         q = self.q_proj(x).view(
             B, T, self.num_heads, self.head_size).transpose(1, 2)
         k = self.k_proj(x).view(
-            B, T, self.num_heads, self.head_size).transpose(1, 2)
+            B, T, 1, self.head_size).transpose(1, 2)
         v = self.v_proj(x).view(
-            B, T, self.num_heads, self.head_size).transpose(1, 2)
+            B, T, 1, self.head_size).transpose(1, 2)
 
         past_length = past_key_values.get_seq_length()\
                         if past_key_values is not None else 0
@@ -138,7 +138,7 @@ class Block(nn.Module):
             dropout: float,
     ) -> None:
         super().__init__()
-        self.sa_heads = MultiHeadAttention(
+        self.sa_heads = MultiQueryAttention(
             num_heads, n_embed, block_size, dropout)
         self.ffwd = FeedForward(n_embed, activation, dropout)
         self.rms_norm1 = nn.RMSNorm(n_embed, eps=1e-6)
