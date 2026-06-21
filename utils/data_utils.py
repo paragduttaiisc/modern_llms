@@ -2,7 +2,9 @@ import json
 import torch
 import numpy as np
 from transformers import AutoTokenizer, PreTrainedTokenizer
-from torch.utils.data import IterableDataset
+from torch.utils.data._utils.collate import default_collate
+
+from torch.utils.data import Dataset, IterableDataset
 
 
 def get_tokenizer(tokenizer_path: str = "tokenizer") -> PreTrainedTokenizer:
@@ -54,3 +56,68 @@ class TokenDataset(IterableDataset):
                     "attention_mask": attention_mask,
                     "labels": labels
                 }
+
+
+class HellaswagDataset(Dataset):
+    def __init__(self, data_path: str):
+        sentences = np.load(data_path, allow_pickle=True)
+
+        assert len(sentences) % 4 == 0
+
+        self.sentences = sentences.reshape(-1, 4, sentences.shape[-1])
+
+        self.lengths = np.array([
+            [
+                np.where(candidate != 0)[0][-1] + 1
+                for candidate in example
+            ]
+            for example in self.sentences
+        ])
+
+    def __len__(self):
+        return len(self.sentences)
+
+    def __getitem__(self, idx):
+        sentences = self.sentences[idx]      # [4, seq_len]
+        lengths = self.lengths[idx]          # [4]
+
+        input_ids = []
+        labels = []
+        attention_masks = []
+
+        for sentence, length in zip(sentences, lengths):
+            pad_len = len(sentence) - length
+
+            input_ids.append(sentence[:-1])
+            labels.append(sentence[1:])
+
+            attention_masks.append(
+                np.concatenate([
+                    np.ones(length - 1),
+                    np.zeros(pad_len)
+                ])
+            )
+
+        return {
+            "input_ids": torch.tensor(
+                np.stack(input_ids),
+                dtype=torch.long
+            ),
+            "labels": torch.tensor(
+                np.stack(labels),
+                dtype=torch.long
+            ),
+            "attention_mask": torch.tensor(
+                np.stack(attention_masks),
+                dtype=torch.long
+            )
+        }
+
+
+def hellaswag_collate_fn(batch):
+    batch = default_collate(batch)
+
+    return {
+        k: v.flatten(0, 1)
+        for k, v in batch.items()
+    }

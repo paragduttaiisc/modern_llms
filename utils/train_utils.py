@@ -4,9 +4,11 @@ import time
 import torch
 from transformers import Trainer
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
-from .optimizer_utils import MultiOptimizer, MultiScheduler
+from torch.utils.data import DataLoader
 from typing import Optional
 
+from .optimizer_utils import MultiOptimizer, MultiScheduler
+from .data_utils import HellaswagDataset, hellaswag_collate_fn
 from .misc_utils import human_readable_numbers as hrn
 
 
@@ -135,6 +137,69 @@ class LLMTrainer(Trainer):
                 self.args.world_size if hasattr(self.args, "world_size") else 1
             self.total_tokens += local_tokens * world_size
         return loss
+    
+    @torch.no_grad()
+    def evaluate_hellaswag(self) -> float:
+        dataset = HellaswagDataset(
+            "data/Hellaswag/hellaswag_tokenized.npy"
+        )
+
+        loader = DataLoader(
+            dataset,
+            batch_size=self.args.per_device_eval_batch_size,
+            num_workers=self.args.dataloader_num_workers,
+            persistent_workers=self.args.dataloader_persistent_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+            collate_fn=hellaswag_collate_fn,
+            shuffle=False,
+        )
+
+        loader = self.accelerator.prepare(loader)
+
+        local_correct = 0
+        local_total = 0
+
+        for batch in loader:
+            batch = {
+                k: v.to(self.accelerator.device, non_blocking=True)
+                for k, v in batch.items()
+            }
+
+            outputs = self.model(**batch, return_per_sample_loss=True) # type: ignore
+
+            preds = outputs.loss.reshape(-1, 4).argmin(dim=1)
+
+            local_correct += (preds == 0).sum().item()
+            local_total += preds.numel()
+
+        correct = torch.tensor([local_correct], device=self.accelerator.device)
+        total = torch.tensor([local_total], device=self.accelerator.device)
+
+        correct = self.accelerator.gather(correct).sum() # type: ignore
+        total = self.accelerator.gather(total).sum() # type: ignore
+
+        return (correct.float() / total.float()).item()
+    
+    def evaluate(
+        self,
+        eval_dataset=None,
+        ignore_keys=None,
+        metric_key_prefix="eval",
+    ):
+        metrics = super().evaluate(
+            eval_dataset=eval_dataset,
+            ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix,
+        )
+
+        self.model.eval() # type: ignore
+        hellaswag_acc = self.evaluate_hellaswag()
+        self.model.train() # type: ignore
+
+        metrics["eval_hellaswag_acc"] = hellaswag_acc
+        self.log({"eval_hellaswag_acc": hellaswag_acc})
+
+        return metrics
     
     def log(self, logs: dict, *args, **kwargs) -> None:
         logs.pop("learning_rate", None)
