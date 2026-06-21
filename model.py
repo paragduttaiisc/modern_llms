@@ -32,7 +32,7 @@ class ModelConfig(PreTrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
-        self.num_kv_heads = num_attention_heads if num_kv_heads is not None\
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None\
                                 else num_attention_heads
 
 class GroupedQueryAttention(nn.Module):
