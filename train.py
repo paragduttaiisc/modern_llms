@@ -16,6 +16,7 @@ from utils import (
 
 def main(args: argparse.Namespace):
     # Setup
+    torch.set_float32_matmul_precision('medium' if args.use_bf16 else 'high')
     set_seed(args.seed)
     os.environ["WANDB_PROJECT"] = args.wandb_project
     os.environ["WANDB_ENTITY"] = args.wandb_entity
@@ -148,6 +149,4 @@ if __name__ == "__main__":
     parser.add_argument("--wandb-project", type=str, default="improved-transformer")
     parser.add_argument("--wandb-entity", type=str, default="statsml-csa-iisc")
     args = parser.parse_args()
-    torch.set_float32_matmul_precision('medium' if args.use_bf16 else 'high')
-    set_seed(args.seed)
     main(args)
