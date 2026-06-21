@@ -237,6 +237,7 @@ class Model(PreTrainedModel, GenerationMixin):
         num_items_in_batch: Optional[int] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = None,
+        return_per_sample_loss: bool = False,
         **kwargs,
     ) -> CausalLMOutputWithPast:
 
@@ -262,13 +263,25 @@ class Model(PreTrainedModel, GenerationMixin):
         if labels is None:
             loss = None
         else:
-            _, _, C = logits.shape
+            B, T, C = logits.shape
 
-            reduction = "sum" if num_items_in_batch is not None else "mean"
+            if attention_mask is not None:
+                labels[attention_mask == 0] = -100
+            
             loss = F.cross_entropy(
-                logits.view(-1, C), labels.view(-1), reduction=reduction)
-            if num_items_in_batch is not None:
-                loss = loss / num_items_in_batch
+                logits.view(-1, C),
+                labels.view(-1),
+                ignore_index=-100,
+                reduction="none",
+            )
+
+            if return_per_sample_loss:
+                loss = loss.view(B, T)
+                loss = loss.sum(dim=1) / (labels != -100).sum(dim=1).clamp_min(1)
+            elif num_items_in_batch is not None:
+                loss = loss.sum() / num_items_in_batch
+            else:
+                loss = loss.mean()
 
         return CausalLMOutputWithPast(
             logits=logits,
