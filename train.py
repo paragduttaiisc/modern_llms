@@ -27,8 +27,10 @@ def main(args: argparse.Namespace):
         effective_batch_size *= world_size
     effective_token_size = effective_batch_size * args.block_size
     accelerator = Accelerator(
-        mixed_precision="bf16" if args.use_bf16 and torch.cuda.is_available() else "no",
-        gradient_accumulation_steps=math.ceil(effective_tokens_target / effective_token_size),
+        mixed_precision="bf16" if args.use_bf16 and torch.cuda.is_available()\
+            else "no", gradient_accumulation_steps=args.grad_accum_steps\
+                if args.grad_accum_steps != -1 else\
+                    math.ceil(effective_tokens_target / effective_token_size),
     )
     if accelerator.is_main_process:
         print("Targeted Effective tokens:", hrn(args.effective_tokens_target))
@@ -36,7 +38,8 @@ def main(args: argparse.Namespace):
         print("Batch size per GPU:", args.batch_size)
         print("Sequence length:", args.block_size)
         print("Total effective token size:", hrn(effective_token_size))
-        print("Gradient accumulation steps:", accelerator.gradient_accumulation_steps)
+        print("Gradient accumulation steps:",
+              accelerator.gradient_accumulation_steps)
     
     # Prepare data
     tokenizer = get_tokenizer()
@@ -81,22 +84,24 @@ def main(args: argparse.Namespace):
         max_steps=args.n_iters,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
-        eval_on_start=True,
-        eval_strategy="steps",
-        eval_steps=args.eval_interval,
+        eval_on_start=not args.dont_eval,
+        eval_strategy="no" if args.dont_eval else "steps",
+        eval_steps=None if args.dont_eval else args.eval_interval,
         gradient_accumulation_steps=accelerator.gradient_accumulation_steps,
-        save_total_limit=5,
-        save_steps=args.save_interval,
+        save_total_limit=0 if args.dont_save else 5,
+        save_strategy="no" if args.dont_save else "steps",
+        save_steps=-1 if args.dont_save else args.save_interval,
         learning_rate=args.adamw_lr,
         weight_decay=args.adamw_weight_decay,
         bf16=args.use_bf16 and torch.cuda.is_available(),
         logging_steps=args.log_interval,
-        report_to="wandb" if args.wandb_run_name else "tensorboard",
         run_name=args.wandb_run_name,
         project=args.wandb_project,
         max_grad_norm=args.max_grad_norm,
         dataloader_num_workers=args.num_workers,
         ddp_find_unused_parameters=False,
+        report_to="wandb" if args.wandb_run_name else\
+            "none" if args.dont_log else "tensorboard",
     )
     trainer = LLMTrainer(
         model=model,
@@ -129,6 +134,7 @@ if __name__ == "__main__":
     parser.add_argument("--n-heads", type=int, default=12)
     parser.add_argument("--n-layers", type=int, default=12)
     parser.add_argument("--non-linearity", type=str, default="SwiGLU", choices=["GELU", "SwiGLU", "SqReLU"])
+    parser.add_argument("--grad-accum-steps", type=int, default=-1)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--adamw-lr", type=float, default=1e-3)
     parser.add_argument("--adamw-weight-decay", type=float, default=0.1)
@@ -147,6 +153,9 @@ if __name__ == "__main__":
     parser.add_argument("--eval-interval", type=int, default=500)
     parser.add_argument("--save-interval", type=int, default=5000)
     parser.add_argument("--use-bf16", action="store_true")
+    parser.add_argument("--dont-log", action="store_true")
+    parser.add_argument("--dont-save", action="store_true")
+    parser.add_argument("--dont-eval", action="store_true")
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--wandb-project", type=str, default="improved-transformer")
     parser.add_argument("--wandb-entity", type=str, default="statsml-csa-iisc")
