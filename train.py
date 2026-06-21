@@ -107,6 +107,7 @@ def main(args: argparse.Namespace):
         muon_lr=args.muon_lr,
         muon_weight_decay=args.muon_weight_decay
     )
+    model.apply(model.weight_init)
     if accelerator.is_main_process:
         print("Starting training...")
     trainer.train()
