@@ -16,10 +16,11 @@ class ModelConfig(PreTrainedConfig):
             self,
             vocab_size: int = 65,
             block_size: int = 256,
-            hidden_size: int = 384,
+            embedding_size: int = 384,
+            head_size: int = 64,
+            kv_latent_size: int = 96,
             num_hidden_layers: int = 6,
             num_attention_heads: int = 4,
-            num_kv_heads: Optional[int] = None,
             non_linearity: str = "GELU",
             dropout: float = 0.2,
             **kwargs
@@ -30,36 +31,34 @@ class ModelConfig(PreTrainedConfig):
         self.dropout = dropout
         self.non_linearity = non_linearity
         self.num_hidden_layers = num_hidden_layers
-        self.hidden_size = hidden_size
+        self.embedding_size = embedding_size
+        self.head_size = head_size
+        self.kv_latent_size = kv_latent_size
         self.num_attention_heads = num_attention_heads
-        self.num_kv_heads = num_kv_heads if num_kv_heads is not None\
-                                else num_attention_heads
 
-class GroupedQueryAttention(nn.Module):
+
+class MultiHeadedLatentAttention(nn.Module):
     def __init__(
             self,
             num_heads: int,
-            num_kv_heads: int,
-            n_embed: int,
+            embed_dim: int,
+            head_dim: int,
+            kv_latent_dim: int,
             block_size: int,
             dropout: float,
     ) -> None:
         super().__init__()
-        assert num_heads % num_kv_heads == 0,\
-            "num_heads must be divisible by num_kv_heads"
-
         self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
-        self.n_repeat = num_heads // num_kv_heads
-        self.head_size = n_embed // num_heads
+        self.embed_dim = embed_dim
+        self.head_dim = head_dim
+        self.kv_latent_dim = kv_latent_dim
 
-        self.q_proj = nn.Linear(n_embed, n_embed, bias=False)
-        self.k_proj = nn.Linear(
-            n_embed, self.head_size * self.num_kv_heads, bias=False)
-        self.v_proj = nn.Linear(
-            n_embed, self.head_size * self.num_kv_heads, bias=False)
+        self.q_proj = nn.Linear(embed_dim, num_heads * head_dim, bias=False)
+        self.kv_down = nn.Linear(embed_dim, kv_latent_dim, bias=False)
+        self.k_up = nn.Linear(kv_latent_dim, num_heads * head_dim, bias=False)
+        self.v_up = nn.Linear(kv_latent_dim, num_heads * head_dim, bias=False)
 
-        self.proj = nn.Linear(n_embed, n_embed)
+        self.proj = nn.Linear(num_heads * head_dim, embed_dim)
         self.dropout = nn.Dropout(dropout)
 
         self.flash = hasattr(F, 'scaled_dot_product_attention')
@@ -67,38 +66,32 @@ class GroupedQueryAttention(nn.Module):
             self.register_buffer(
                 'mask', torch.tril(torch.ones(block_size, block_size)))
     
-    def _repeat_kv(self, x: torch.Tensor) -> torch.Tensor:
-        if self.n_repeat == 1:
-            return x
-        B, H, T, C = x.shape
-        x = x.unsqueeze(2).expand(B, H, self.n_repeat, T, C)
-        return x.reshape(B, H * self.n_repeat, T, C)
-    
     def forward(
             self,
             x: torch.Tensor,
             rotary_emb: RotaryEmbedding,
             past_key_values: Optional[Cache] = None,
+            past_length: Optional[int] = 0,
             layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
-        B, T, C = x.shape
+        B, T, _ = x.shape
         q = self.q_proj(x).view(
-            B, T, self.num_heads, self.head_size).transpose(1, 2)
-        k = self.k_proj(x).view(
-            B, T, self.num_kv_heads, self.head_size).transpose(1, 2)
-        v = self.v_proj(x).view(
-            B, T, self.num_kv_heads, self.head_size).transpose(1, 2)
+            B, T, self.num_heads, self.head_dim).transpose(1, 2)
 
-        past_length = past_key_values.get_seq_length()\
-                        if past_key_values is not None else 0
-
-        q = rotary_emb.rotate_queries_or_keys(q, offset=past_length)
-        k = rotary_emb.rotate_queries_or_keys(k, offset=past_length)
+        c = self.kv_down(x)
 
         if past_key_values is not None:
-            k, v = past_key_values.update(k, v, layer_idx) # type: ignore
+            c, _ = past_key_values.update(c, torch.empty_like(c), layer_idx) # type: ignore
         
-        k, v = self._repeat_kv(k), self._repeat_kv(v)
+        T_k = c.shape[1]
+
+        k = self.k_up(c).view(
+            B, T_k, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_up(c).view(
+            B, T_k, self.num_heads, self.head_dim).transpose(1, 2)
+
+        q = rotary_emb.rotate_queries_or_keys(q, offset=past_length) # type: ignore
+        k = rotary_emb.rotate_queries_or_keys(k, offset=0)
 
         if self.flash: 
             is_causal = (T > 1) 
@@ -106,7 +99,7 @@ class GroupedQueryAttention(nn.Module):
                 q, k, v, attn_mask=None, is_causal=is_causal,
                 dropout_p=self.dropout.p if self.training else 0.0)
         else: 
-            att = q @ k.transpose(-2, -1) * (self.head_size ** -0.5)
+            att = q @ k.transpose(-2, -1) * (self.head_dim ** -0.5)
             if T > 1:
                 T_k = k.shape[-2]
                 causal_mask = self.mask[T_k - T:T_k, :T_k] # type: ignore
@@ -115,14 +108,15 @@ class GroupedQueryAttention(nn.Module):
             att = self.dropout(att)
             out = att @ v
             
-        out = out.transpose(1, 2).contiguous().view(B, T, C)
-        return self.dropout(self.proj(out))
+        out = out.transpose(1, 2).contiguous().view(B, T, -1)
+        return self.proj(out)
 
 
 class FeedForward(nn.Module):
     def __init__(self, n_embed: int, activation: str, dropout: float):
         super().__init__()
-        assert activation in ["GELU", "SwiGLU", "SqReLU"], "Unsupported activation"
+        assert activation in ["GELU", "SwiGLU", "SqReLU"],\
+            "Unsupported activation"
         hidden_size = 4 * n_embed
         self.act = nn.GELU(approximate="tanh") if activation == "GELU"\
                     else lambda x: F.relu(x).square()
@@ -150,29 +144,38 @@ class FeedForward(nn.Module):
 class Block(nn.Module):
     def __init__(
             self,
-            n_embed: int,
-            num_heads: int,
-            num_kv_heads: int,
+            embedding_size: int,
+            head_size: int,
+            kv_latent_size: int,
+            num_attn_heads: int,
             block_size: int,
             activation: str,
             dropout: float,
     ) -> None:
         super().__init__()
-        self.sa_heads = GroupedQueryAttention(
-            num_heads, num_kv_heads, n_embed, block_size, dropout)
-        self.ffwd = FeedForward(n_embed, activation, dropout)
-        self.rms_norm1 = nn.RMSNorm(n_embed, eps=1e-6)
-        self.rms_norm2 = nn.RMSNorm(n_embed, eps=1e-6)
+        self.sa_heads = MultiHeadedLatentAttention(
+            num_heads=num_attn_heads,
+            embed_dim=embedding_size,
+            head_dim=head_size,
+            kv_latent_dim=kv_latent_size,
+            block_size=block_size,
+            dropout=dropout
+        )
+        self.ffwd = FeedForward(embedding_size, activation, dropout)
+        self.rms_norm1 = nn.RMSNorm(embedding_size, eps=1e-6)
+        self.rms_norm2 = nn.RMSNorm(embedding_size, eps=1e-6)
     
     def forward(
             self,
             x: torch.Tensor,
             rotary_emb: RotaryEmbedding,
             past_key_values: Optional[Cache] = None,
+            past_length: Optional[int] = 0,
             layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
         x = x + self.sa_heads(
-            self.rms_norm1(x), rotary_emb, past_key_values, layer_idx)
+            self.rms_norm1(x), rotary_emb, past_key_values,
+            past_length, layer_idx)
         x = x + self.ffwd(self.rms_norm2(x))
         return x 
 
@@ -187,19 +190,23 @@ class Model(PreTrainedModel, GenerationMixin):
             config: ModelConfig,
     ) -> None:
         super().__init__(config)
-        self.tok_emb_table = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.tok_emb_table = nn.Embedding(
+            config.vocab_size, config.embedding_size)
         self.emb_drop = nn.Dropout(config.dropout)
-        self.head_dim = config.hidden_size // config.num_attention_heads
-        self.rotary_emb = RotaryEmbedding(dim=self.head_dim)
+        self.rotary_emb = RotaryEmbedding(dim=config.head_size)
         self.layers = nn.ModuleList([
             Block(
-                config.hidden_size, config.num_attention_heads,
-                config.num_kv_heads, config.block_size,
-                config.non_linearity, config.dropout
+                embedding_size=config.embedding_size,
+                head_size=config.head_size,
+                kv_latent_size=config.kv_latent_size,
+                num_attn_heads=config.num_attention_heads,
+                block_size=config.block_size,
+                activation=config.non_linearity,
+                dropout=config.dropout
             ) for _ in range(config.num_hidden_layers)
         ])
-        self.rms_norm_f = nn.RMSNorm(config.hidden_size, eps=1e-6)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size)
+        self.rms_norm_f = nn.RMSNorm(config.embedding_size, eps=1e-6)
+        self.lm_head = nn.Linear(config.embedding_size, config.vocab_size)
         self.block_size = config.block_size
         
         self.config.tie_word_embeddings = True
@@ -262,19 +269,20 @@ class Model(PreTrainedModel, GenerationMixin):
         **kwargs,
     ) -> CausalLMOutputWithPast:
 
-        use_cache = (
-            use_cache
-            if use_cache is not None
+        use_cache = use_cache if use_cache is not None\
             else getattr(self.config, "use_cache", True)
-        )
 
         x = self.emb_drop(self.tok_emb_table(input_ids))
+
+        past_length = past_key_values.get_seq_length()\
+            if past_key_values is not None else 0
 
         for i, layer in enumerate(self.layers):
             x = layer(
                 x,
                 self.rotary_emb,
                 past_key_values=past_key_values if use_cache else None,
+                past_length=past_length,
                 layer_idx=i,
             )
 
@@ -307,5 +315,5 @@ class Model(PreTrainedModel, GenerationMixin):
         return CausalLMOutputWithPast(
             logits=logits,
             loss=loss, # type: ignore
-            past_key_values=past_key_values if use_cache else None,
+            past_key_values=past_key_values if use_cache else None, # type: ignore
         )

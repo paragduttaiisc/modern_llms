@@ -62,10 +62,11 @@ def main(args: argparse.Namespace):
     model = Model(ModelConfig(
         vocab_size=args.vocab_size,
         block_size=args.block_size,
-        hidden_size=args.n_embed,
+        embedding_size=args.embed_size,
+        head_size=args.head_size,
+        kv_latent_size=args.kv_latent_size,
         num_hidden_layers=args.n_layers,
         num_attention_heads=args.n_heads,
-        num_kv_heads=args.n_kv_heads,
         non_linearity=args.non_linearity,
         dropout=args.dropout
     ))
@@ -131,10 +132,11 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--vocab-size", type=int, default=49216)
     parser.add_argument("--block-size", type=int, default=2048)
-    parser.add_argument("--n-embed", type=int, default=768)
-    parser.add_argument("--n-heads", type=int, default=12)
-    parser.add_argument("--n-kv-heads", type=int, default=4)
     parser.add_argument("--n-layers", type=int, default=12)
+    parser.add_argument("--n-heads", type=int, default=12)
+    parser.add_argument("--head-size", type=int, default=64)
+    parser.add_argument("--embed-size", type=int, default=768)
+    parser.add_argument("--kv-latent-size", type=int, default=128)
     parser.add_argument("--non-linearity", type=str, default="SwiGLU", choices=["GELU", "SwiGLU", "SqReLU"])
     parser.add_argument("--grad-accum-steps", type=int, default=-1)
     parser.add_argument("--dropout", type=float, default=0.1)
