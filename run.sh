@@ -27,8 +27,9 @@ accelerate launch \
     --num_processes=4 \
     --mixed_precision=bf16 \
     train.py \
-    --batch-size=128 \
-    --n-iters=19000 \
-    --last-decay-iter=17000 \
+    --batch-size=80 \
+    --last-decay-iter=13725 \
+    --n-iters=15250
     --save-dir="outputs" \
+    --wandb-run-name="GPT2-MLA" \
     --use-bf16
