@@ -61,54 +61,48 @@ class MultiHeadedLatentAttention(nn.Module):
         self.proj = nn.Linear(num_heads * head_dim, embed_dim)
         self.dropout = nn.Dropout(dropout)
 
-        self.flash = hasattr(F, 'scaled_dot_product_attention')
-        if not self.flash:
-            self.register_buffer(
-                'mask', torch.tril(torch.ones(block_size, block_size)))
+        self.register_buffer(
+            'mask', torch.tril(torch.ones(block_size, block_size)))
     
     def forward(
             self,
             x: torch.Tensor,
-            rotary_emb: RotaryEmbedding,
+            # rotary_emb: RotaryEmbedding,
             past_key_values: Optional[Cache] = None,
             past_length: Optional[int] = 0,
             layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
-        B, T, _ = x.shape
+        B, T, C = x.shape
         q = self.q_proj(x).view(
-            B, T, self.num_heads, self.head_dim).transpose(1, 2)
+            B, T, self.num_heads, self.head_dim
+        ).transpose(1, 2)
 
         c = self.kv_down(x)
 
         if past_key_values is not None:
             c, _ = past_key_values.update(c, torch.empty_like(c), layer_idx) # type: ignore
-        
-        T_k = c.shape[1]
 
-        k = self.k_up(c).view(
-            B, T_k, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_up(c).view(
-            B, T_k, self.num_heads, self.head_dim).transpose(1, 2)
+        Wk = self.k_up.weight.view(
+            self.num_heads, self.head_dim, self.kv_latent_dim)
+        Wv = self.v_up.weight.view(
+            self.num_heads, self.head_dim, self.kv_latent_dim)
 
-        q = rotary_emb.rotate_queries_or_keys(q, offset=past_length) # type: ignore
-        k = rotary_emb.rotate_queries_or_keys(k, offset=0)
+        q_latent = torch.einsum("bhtd,hdr->bhtr", q, Wk)
 
-        if self.flash: 
-            is_causal = (T > 1) 
-            out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=None, is_causal=is_causal,
-                dropout_p=self.dropout.p if self.training else 0.0)
-        else: 
-            att = q @ k.transpose(-2, -1) * (self.head_dim ** -0.5)
-            if T > 1:
-                T_k = k.shape[-2]
-                causal_mask = self.mask[T_k - T:T_k, :T_k] # type: ignore
-                att = att.masked_fill(causal_mask == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.dropout(att)
-            out = att @ v
-            
-        out = out.transpose(1, 2).contiguous().view(B, T, -1)
+        att = torch.einsum("bhtr,bsr->bhts", q_latent, c)
+        # att = att * (self.kv_latent_dim ** 0.5)
+        att = att * (self.head_dim ** -0.5)
+
+        if T > 1:
+            S = c.shape[1]
+            causal_mask = self.mask[S - T:S, :S] # type: ignore
+            att = att.masked_fill(causal_mask == 0, float("-inf"))
+        att = F.softmax(att, dim=-1)
+        att = self.dropout(att)
+        latent_out = torch.einsum("bhts,bsr->bhtr", att, c)
+
+        out = torch.einsum("bhtr,hdr->bhtd", latent_out, Wv)
+        out = out.transpose(1, 2).contiguous().view(B, T, self.num_heads * self.head_dim)
         return self.proj(out)
 
 
@@ -168,14 +162,18 @@ class Block(nn.Module):
     def forward(
             self,
             x: torch.Tensor,
-            rotary_emb: RotaryEmbedding,
+            # rotary_emb: RotaryEmbedding,
             past_key_values: Optional[Cache] = None,
             past_length: Optional[int] = 0,
             layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
         x = x + self.sa_heads(
-            self.rms_norm1(x), rotary_emb, past_key_values,
-            past_length, layer_idx)
+            self.rms_norm1(x),
+            # rotary_emb,
+            past_key_values,
+            past_length,
+            layer_idx
+        )
         x = x + self.ffwd(self.rms_norm2(x))
         return x 
 
@@ -192,8 +190,10 @@ class Model(PreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.tok_emb_table = nn.Embedding(
             config.vocab_size, config.embedding_size)
+        self.pos_emb_table = nn.Embedding(
+            config.block_size, config.embedding_size)
         self.emb_drop = nn.Dropout(config.dropout)
-        self.rotary_emb = RotaryEmbedding(dim=config.head_size)
+        # self.rotary_emb = RotaryEmbedding(dim=config.head_size)
         self.layers = nn.ModuleList([
             Block(
                 embedding_size=config.embedding_size,
@@ -268,11 +268,14 @@ class Model(PreTrainedModel, GenerationMixin):
         return_per_sample_loss: bool = False,
         **kwargs,
     ) -> CausalLMOutputWithPast:
+        B, T = input_ids.shape
 
         use_cache = use_cache if use_cache is not None\
             else getattr(self.config, "use_cache", True)
-
-        x = self.emb_drop(self.tok_emb_table(input_ids))
+        
+        tok_emb = self.tok_emb_table(input_ids)
+        pos_emb = self.pos_emb_table(torch.arange(T, device=input_ids.device))
+        x = self.emb_drop(tok_emb + pos_emb)
 
         past_length = past_key_values.get_seq_length()\
             if past_key_values is not None else 0
@@ -280,7 +283,7 @@ class Model(PreTrainedModel, GenerationMixin):
         for i, layer in enumerate(self.layers):
             x = layer(
                 x,
-                self.rotary_emb,
+                # self.rotary_emb,
                 past_key_values=past_key_values if use_cache else None,
                 past_length=past_length,
                 layer_idx=i,
