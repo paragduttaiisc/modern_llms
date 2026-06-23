@@ -64,11 +64,12 @@ def main(args: argparse.Namespace):
         block_size=args.block_size,
         embedding_size=args.embed_size,
         head_size=args.head_size,
+        rope_size=args.rope_size,
         kv_latent_size=args.kv_latent_size,
         num_hidden_layers=args.n_layers,
         num_attention_heads=args.n_heads,
         non_linearity=args.non_linearity,
-        dropout=args.dropout
+        dropout=args.dropout,
     ))
     model.config.eos_token_id = tokenizer.eos_token_id
     model.config.pad_token_id = tokenizer.pad_token_id
@@ -135,6 +136,7 @@ if __name__ == "__main__":
     parser.add_argument("--n-layers", type=int, default=12)
     parser.add_argument("--n-heads", type=int, default=12)
     parser.add_argument("--head-size", type=int, default=64)
+    parser.add_argument("--rope-size", type=int, default=16)
     parser.add_argument("--embed-size", type=int, default=768)
     parser.add_argument("--kv-latent-size", type=int, default=128)
     parser.add_argument("--non-linearity", type=str, default="SwiGLU", choices=["GELU", "SwiGLU", "SqReLU"])
