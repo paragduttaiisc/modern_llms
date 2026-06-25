@@ -26,7 +26,6 @@ data -> /home/parag/Data/llm_data   ← Symlink to shard data
 - **MLA Attention** ([attention.py](model/attention.py)): K and V projections share a latent bottleneck (`kv_latent_dim`). K is split into nope (up-projected via `k_up`) and rope components; V is up-projected via `v_up`. Q is split into nope + rope. RoPE is applied only to the rope components. This is the core memory-saving innovation.
 - **Block structure**: Pre-norm RMSNorm → MLA → residual → RMSNorm → FeedForward → residual. Gated SwiGLU or standard activation in FFN.
 - **Dual optimizer**: Muon optimizer for 2D+ parameters (weights), AdamW for 1D params (biases, embeddings). Separate LR schedules: Muon gets warmup → cosine decay → constant plateau; AdamW gets the same 3-phase schedule.
-- **LR schedule**: Linear warmup → cosine annealing → constant plateau (controlled by `warmup_iters` and `last_decay_iter`).
 
 ## Getting Started
 
@@ -52,7 +51,7 @@ accelerate launch train.py --use-bf16 --batch-size=24 --n-layers=12 --n-heads=12
 sbatch run.sh
 ```
 
-The SLURM script (`run.sh`) is configured for 4 H200 GPUs with bf16, batch=80, and ~15K iterations targeting ~500B effective tokens.
+The SLURM script (`run.sh`) is configured for 4 H200 GPUs with bf16, batch=80, and ~15K iterations (approx 10B tokens) targeting ~500M effective tokens per iteration.
 
 ### Key arguments
 
