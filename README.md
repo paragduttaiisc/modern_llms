@@ -51,7 +51,7 @@ accelerate launch train.py --use-bf16 --batch-size=24 --n-layers=12 --n-heads=12
 sbatch run.sh
 ```
 
-The SLURM script (`run.sh`) is configured for 4 H200 GPUs with bf16, batch=80, and ~15K iterations (approx 10B tokens) targeting ~500M effective tokens per iteration.
+The SLURM script (`run.sh`) is configured for 4 H200 GPUs with bf16, batch=80, and ~15K iterations (approx 10B tokens) targeting ~500K effective tokens per iteration.
 
 ### Key arguments
 
