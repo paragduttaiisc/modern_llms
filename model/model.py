@@ -30,12 +30,14 @@ class Model(PreTrainedModel, GenerationMixin):
             Block(
                 embedding_size=config.embedding_size,
                 head_size=config.head_size,
+                n_experts=config.experts,
+                n_active_experts=config.active_experts,
                 rope_size=config.rope_size,
                 kv_latent_size=config.kv_latent_size,
                 num_attn_heads=config.num_attention_heads,
                 block_size=config.block_size,
                 activation=config.non_linearity,
-                dropout=config.dropout
+                dropout=config.dropout,
             ) for _ in range(config.num_hidden_layers)
         ])
         self.rms_norm_f = nn.RMSNorm(config.embedding_size, eps=1e-6)
@@ -44,6 +46,9 @@ class Model(PreTrainedModel, GenerationMixin):
         
         self.config.tie_word_embeddings = True
         self.post_init()
+
+        self.last_lm_loss = None
+        self.last_router_loss = None
     
     def weight_init(self, module):
         if isinstance(module, nn.Linear):
@@ -108,17 +113,22 @@ class Model(PreTrainedModel, GenerationMixin):
         
         x = self.emb_drop(self.tok_emb_table(input_ids))
 
+        x = x.to(next(self.parameters()).dtype)
+
         past_length = past_key_values.get_seq_length()\
             if past_key_values is not None else 0
 
+        aux_loss = 0.0
         for i, layer in enumerate(self.layers):
-            x = layer(
+            x, router_loss = layer(
                 x,
                 self.rotary_emb,
                 past_key_values=past_key_values if use_cache else None,
                 past_length=past_length,
                 layer_idx=i,
             )
+            aux_loss += router_loss
+        aux_loss /= len(self.layers)
 
         x = self.rms_norm_f(x)
         logits = self.lm_head(x)
@@ -131,7 +141,7 @@ class Model(PreTrainedModel, GenerationMixin):
             if attention_mask is not None:
                 labels[attention_mask == 0] = -100
             
-            loss = F.cross_entropy(
+            lm_loss = F.cross_entropy(
                 logits.view(-1, C),
                 labels.view(-1),
                 ignore_index=-100,
@@ -139,12 +149,17 @@ class Model(PreTrainedModel, GenerationMixin):
             )
 
             if return_per_sample_loss:
-                loss = loss.view(B, T)
-                loss = loss.sum(dim=1) / (labels != -100).sum(dim=1).clamp_min(1)
+                lm_loss = lm_loss.view(B, T)
+                loss = lm_loss.sum(dim=1) / (labels != -100).sum(dim=1).clamp_min(1)
             elif num_items_in_batch is not None:
-                loss = loss.sum() / num_items_in_batch
+                lm_loss = lm_loss.sum() / num_items_in_batch
+                loss = lm_loss + self.config.router_loss_coef * aux_loss
             else:
-                loss = loss.mean()
+                lm_loss = lm_loss.mean()
+                loss = lm_loss + self.config.router_loss_coef * aux_loss
+
+            self.last_lm_loss = lm_loss.detach()
+            self.last_router_loss = router_loss.detach()
 
         return CausalLMOutputWithPast(
             logits=logits,

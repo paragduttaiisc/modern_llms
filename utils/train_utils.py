@@ -217,7 +217,23 @@ class LLMTrainer(Trainer):
                     logs["iter_time"] = elapsed / steps_passed
                     logs["samples_per_sec"] =\
                         (tokens_passed / self.block_size) / elapsed
-            
+                    if hasattr(self.model, "last_lm_loss"):
+                        logs["lm_loss"] = self.model.last_lm_loss.item() # type: ignore
+                    if hasattr(self.model, "last_router_loss"):
+                        logs["router_loss"] = self.model.last_router_loss.item() # type: ignore
+                    avg_load = torch.stack([
+                        layer.moe.last_load.float() for layer in self.model.layers # type: ignore
+                    ]).mean(0)
+                    avg_tokens = torch.stack([
+                        layer.moe.last_num_tokens.float() for layer in self.model.layers # type: ignore
+                    ]).mean(0)
+                    avg_importance = torch.stack([
+                        layer.moe.last_importance.float() for layer in self.model.layers # type: ignore
+                    ]).mean(0)
+                    for i in range(avg_load.numel()):
+                        logs[f"expert_{i}_load"] = avg_load[i].item()
+                        logs[f"expert_{i}_tokens"] = avg_tokens[i].item()
+                        logs[f"expert_{i}_importance"] = avg_importance[i].item()
             if self.optimizer is not None:
                 base_opt = self.optimizer
                 while hasattr(base_opt, "optimizer")\

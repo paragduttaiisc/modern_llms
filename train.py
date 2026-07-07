@@ -68,6 +68,9 @@ def main(args: argparse.Namespace):
         kv_latent_size=args.kv_latent_size,
         num_hidden_layers=args.n_layers,
         num_attention_heads=args.n_heads,
+        experts=args.n_experts,
+        active_experts=args.n_active_experts,
+        router_loss_coeff=args.router_loss_weight,
         non_linearity=args.non_linearity,
         dropout=args.dropout,
     ))
@@ -102,7 +105,7 @@ def main(args: argparse.Namespace):
         project=args.wandb_project,
         max_grad_norm=args.max_grad_norm,
         dataloader_num_workers=args.num_workers,
-        ddp_find_unused_parameters=False,
+        ddp_find_unused_parameters=True,
         report_to="wandb" if args.wandb_run_name else\
             "none" if args.dont_log else "tensorboard",
     )
@@ -138,6 +141,8 @@ if __name__ == "__main__":
     parser.add_argument("--head-size", type=int, default=64)
     parser.add_argument("--rope-size", type=int, default=16)
     parser.add_argument("--embed-size", type=int, default=768)
+    parser.add_argument("--n-experts", type=int, default=8)
+    parser.add_argument("--n-active-experts", type=int, default=2)
     parser.add_argument("--kv-latent-size", type=int, default=128)
     parser.add_argument("--non-linearity", type=str, default="SwiGLU", choices=["GELU", "SwiGLU", "SqReLU"])
     parser.add_argument("--grad-accum-steps", type=int, default=-1)
@@ -149,6 +154,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--betas", type=float, nargs=2, default=(0.9, 0.95))
     parser.add_argument("--optimizer-epsilon", type=float, default=1e-8)
+    parser.add_argument("--router-loss-weight", type=float, default=0.01)
     parser.add_argument("--use-fused-optimizer", type=bool, default=True)
     parser.add_argument("--batch-size", type=int, default=24)
     parser.add_argument("--effective-tokens-target", type=int, default=2**19)

@@ -10,6 +10,9 @@ class ModelConfig(PreTrainedConfig):
             block_size: int = 256,
             embedding_size: int = 384,
             head_size: int = 64,
+            experts: int = 8,
+            active_experts: int = 2,
+            router_loss_coef: float = 0.01,
             rope_size: int = 16,
             kv_latent_size: int = 96,
             num_hidden_layers: int = 6,
@@ -26,6 +29,9 @@ class ModelConfig(PreTrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.embedding_size = embedding_size
         self.head_size = head_size
+        self.experts = experts
+        self.active_experts = active_experts
+        self.router_loss_coef = router_loss_coef
         self.rope_size = rope_size
         self.kv_latent_size = kv_latent_size
         self.num_attention_heads = num_attention_heads
