@@ -54,9 +54,24 @@ class Model(PreTrainedModel, GenerationMixin):
     
     def weight_init(self, module):
         if isinstance(module, nn.Linear):
-            nn.init.xavier_normal_(module.weight)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
+            if (
+                any(x in type(module).__name__ for x in ["MHCRouter"])
+                or (
+                    hasattr(module, 'out_features')
+                    and
+                    module.out_features in [4, 16]
+            )):
+                nn.init.normal_(module.weight, mean=0.0, std=0.001)
+                if module.bias is not None:
+                    if module.out_features == 16: # TODO: make more general
+                        with torch.no_grad():
+                            module.bias.copy_(torch.eye(4).view(-1) * 0.1)
+                    else:
+                        nn.init.zeros_(module.bias)
+            else:
+                nn.init.xavier_normal_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             module.weight.data.normal_(
                 mean=0.0, std=1.0 / math.sqrt(module.embedding_dim))

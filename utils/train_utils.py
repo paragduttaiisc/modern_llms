@@ -45,7 +45,12 @@ class LLMTrainer(Trainer):
             
             for name, p in self.model.named_parameters(): # type: ignore
                 if p.requires_grad:
-                    if p.dim() >= 2 and not\
+                    if any(k in name for k in ["mhc", "router"]):
+                        if p.dim() >= 2:
+                            adamw_decay_params.append(p)
+                        else:
+                            adamw_nodecay_params.append(p)
+                    elif p.dim() >= 2 and not\
                             any(k in name for k in ["emb", "head"]):
                         muon_params.append(p)
                     else:
