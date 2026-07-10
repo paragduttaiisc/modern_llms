@@ -54,9 +54,15 @@ class Block(nn.Module):
         self.rms_norm1 = nn.RMSNorm(embedding_size, eps=1e-6)
         self.rms_norm2 = nn.RMSNorm(embedding_size, eps=1e-6)
 
-        self.attn_mhc = MHCRouter(n_streams=num_residual_streams)
-        self.ffn_mhc = MHCRouter(n_streams=num_residual_streams)
-    
+        self.attn_mhc = MHCRouter(
+            embedding_size=embedding_size,
+            n_streams=num_residual_streams
+        )
+        self.ffn_mhc = MHCRouter(
+            embedding_size=embedding_size,
+            n_streams=num_residual_streams
+        )
+
     def forward(
             self,
             x: torch.Tensor,
