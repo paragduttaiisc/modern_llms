@@ -1,8 +1,35 @@
 # Modern LLMs
 
+<div align="center">
+
 Extending [nanoGPT](https://github.com/karpathy/nanoGPT) to train modern billion-parameter LLMs from scratch on local/multi-GPU hardware.
 
-## Architecture at a Glance
+[![License: CC0-1.0](https://img.shields.io/badge/License-CC0--1.0-lightgrey.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.x-ee4c2c.svg)](https://pytorch.org/)
+[![Accelerate](https://img.shields.io/badge/Accelerate-DDP-orange.svg)](https://huggingface.co/docs/accelerate)
+
+</div>
+
+<!-- ---
+
+## 📺 Video Lectures
+
+> A companion video lecture series walking through the architecture, training tricks, and code — from first principles to a modern transformer.
+
+| # | Topic | Status |
+|---|-------|--------|
+| 1 | Project overview & setup | 🔜 Coming soon |
+| 2 | Multi-Headed Latent Attention (MLA) | 🔜 Coming soon |
+| 3 | Mixture of Experts (MoE) training | 🔜 Coming soon |
+| 4 | Dual optimizer (Muon + AdamW) | 🔜 Coming soon |
+| 5 | Training at scale with Accelerate | 🔜 Coming soon |
+
+📎 [Link to playlist](https://youtube.com/playlist?list=YOUR_PLAYLIST_ID) — *placeholder* -->
+
+---
+
+## 🏗️ Architecture
 
 ```
 train.py / infer.py          ← Entry points
@@ -21,17 +48,73 @@ tokenizer/                   ← Custom tokenizer (starcoderbase base + special 
 data -> /home/parag/Data/llm_data   ← Symlink to shard data
 ```
 
+### Block diagram
+
+```
+Input Embedding
+       │
+       ▼
+┌───────────────────────────────────────┐
+│           Transformer Block           │
+│                                       │
+│   ┌─────────────┐    ┌────────────┐   │
+│   │ RMSNorm  ──►│───►│ MLA        │   │
+│   └─────────────┘    │ (latent    │   │
+│                      │  K/V)      │   │
+│                      └────────────┘   │
+│              ▲          │             │
+│              │     residual           │
+│              │          ▼             │
+│   ┌─────────────┐    ┌────────────┐   │
+│   │ RMSNorm  ──►│───►│ FFN / MoE  │   │
+│   └─────────────┘    └────────────┘   │
+└───────────────────────────────────────┘
+       │
+       ▼
+   LM Head
+```
+
 ### Key architectural details
 
-- **MLA Attention** ([attention.py](model/attention.py)): K and V projections share a latent bottleneck (`kv_latent_dim`). K is split into nope (up-projected via `k_up`) and rope components; V is up-projected via `v_up`. Q is split into nope + rope. RoPE is applied only to the rope components. This is the core memory-saving innovation.
+<details>
+<summary><b>Click to expand architectural deep-dive</b></summary>
+
+- **MLA Attention** — K and V projections share a latent bottleneck (`kv_latent_dim`). K is split into nope (up-projected via `k_up`) and rope components; V is up-projected via `v_up`. Q is split into nope + rope. RoPE is applied only to the rope components. This is the core memory-saving innovation.
 - **Block structure**: Pre-norm RMSNorm → MLA → residual → RMSNorm → FFN → residual. The FFN is either a plain MLP (when `n_experts=1`) or a sparse MoE (when `n_experts>1`). Gated SwiGLU or standard activation.
-- **MoE / MLP** ([feed_forward.py](model/feed_forward.py)): Each FFN layer is either a sparse Mixture-of-Experts with top-k gating (when `n_experts > 1`) or a plain MLP (when `n_experts == 1`). The MoE load balancing auxiliary loss (MSE between expert load/importance and uniform) is tracked and added to the total loss via `router_loss_coef`. When using an MLP, the router loss is zero.
-- **Dual optimizer**: Muon optimizer for 2D+ parameters (weights), AdamW for 1D params (biases, embeddings). Separate LR schedules: Muon gets warmup → cosine decay → constant plateau; AdamW gets the same 3-phase schedule.
+- **MoE** — Each FFN layer is replaced by a sparse Mixture-of-Experts with top-k gating. Load balancing auxiliary loss (MSE between expert load/importance and uniform) is tracked and added to the total loss via `router_loss_coef`.
+- **Dual optimizer** — Muon optimizer for 2D+ parameters (weights), AdamW for 1D params (biases, embeddings). Separate LR schedules: Muon gets warmup → cosine decay → constant plateau; AdamW gets the same 3-phase schedule.
 
-## Getting Started
+</details>
 
-- Clone the repo
-- Create a Python virtual environment and install requirements
+<!-- ---
+
+## 📚 Paper References
+
+Techniques used in this project, with links to the original papers:
+
+| Technique | Paper |
+|-----------|-------|
+| **Multi-Headed Latent Attention (MLA)** | [DeepSeek-V3 Technical Report](https://arxiv.org/abs/2412.19437) |
+| **Mixture of Experts (MoE)** | [Mixtral of Experts](https://arxiv.org/abs/2401.04088) |
+| **Muon Optimizer** | [Muon: Momentum Orthogonalized NeuralOptimizer](https://arxiv.org/abs/2411.02884) |
+| **Flash Attention** | [FlashAttention: Fast and Memory-Efficient Exact Attention](https://arxiv.org/abs/2205.14135) |
+| **Rotary Positional Embeddings (RoPE)** | [RoFormer: Enhanced Transformer with Rotary Position Embedding](https://arxiv.org/abs/2104.09864) |
+| **Gated Linear Units (GLU)** | [Language Models are Few-Shot Learners (GPT-3)](https://arxiv.org/abs/2005.14165) |
+| **SwiGLU Activation** | [GLU Variants Improve Transformer](https://arxiv.org/abs/2105.09118) |
+| **RMSNorm** | [Root Mean Layer Normalization](https://arxiv.org/abs/1910.07467) |
+| **nanoGPT** | [nanoGPT — The simplest best tutorial/training codebase for training LLMs](https://github.com/karpathy/nanoGPT) |
+
+--- -->
+
+## 🚀 Getting Started
+
+### Prerequisites
+
+- Python 3.10+
+- CUDA-capable GPU(s) (tested on H200, A100, RTX 4090)
+- 80GB+ VRAM per GPU for full-scale training (less for smaller configs)
+
+### Installation
 
 ```bash
 git clone git@github.com:paragduttaiisc/modern_llms.git
@@ -41,18 +124,16 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Training
+---
+
+## 🎯 Training
+
+### MoE (default)
 
 ```bash
-# Single GPU / debug (MoE)
+# Single GPU / debug
 accelerate launch train.py --use-bf16 --batch-size=24 --n-layers=12 --n-heads=12 \
     --block-size=2048 --n-iters=25400 --save-dir=models/your_model
-
-# Plain MLP (n_experts=1)
-accelerate launch --num_processes=8 --mixed_precision=bf16 train.py --use-bf16 --n-experts=1 \
-    --router-loss-weight=0.0 --batch-size=16 --n-iters=38140 --warmup-iters=500 \
-    --last-decay-iter=37000 --eval-interval=1000 --save-interval=5000 \
-    --wandb-run-name="<RunName>"
 
 # Multi-GPU (SLURM via run.sh)
 sbatch run.sh
@@ -60,26 +141,40 @@ sbatch run.sh
 
 The SLURM script (`run.sh`) is configured for 4 H200 GPUs with bf16, batch=80, and ~15K iterations (approx 10B tokens) targeting ~500K effective tokens per iteration.
 
+### Plain MLP
+
+Set `--n-experts=1` to disable MoE and train with a standard feed-forward network (no router loss):
+
+```bash
+accelerate launch --num_processes=8 --mixed_precision=bf16 train.py --use-bf16 --n-experts=1 \
+    --router-loss-weight=0.0 --batch-size=16 --n-iters=38140 --warmup-iters=500 \
+    --last-decay-iter=37000 --eval-interval=1000 --save-interval=5000 \
+    --wandb-run-name="<RunName>"
+```
+
 ### Key arguments
 
 | Argument | Default | Purpose |
-|---|---|---|
+|----------|---------|---------|
 | `--block-size` | 2048 | Sequence length |
 | `--n-layers` | 12 | Transformer layers |
 | `--n-heads` | 12 | Attention heads |
-| `--head-size` | 64 | Per-head dimension |
+| `--attn-head-size` | 64 | Per-head dimension |
 | `--kv-latent-size` | 128 | MLA latent bottleneck |
 | `--rope-size` | 16 | RoPE dimension (subset of head_size) |
 | `--embed-size` | 768 | Model hidden dimension |
-| `--non-linearity` | SwiGLU | FFN activation (GELU/SwGLU/SqReLU) |
-| `--effective-tokens-target` | 2^19 | Target tokens for grad accum calc |
-| `--muon-lr` | 0.02 | Muon optimizer LR |
-| `--adamw-lr` | 1e-3 | AdamW optimizer LR |
-| `--n-experts` | 8 | Number of MoE experts per layer (1 = plain MLP) |
+| `--mlp-hidden-size` | 3072 | FFN hidden dimension |
+| `--non-linearity` | SqReLU | FFN activation (GELU / SwiGLU / SqReLU) |
+| `--n-experts` | 8 | Number of MoE experts per layer (**1 = plain MLP**) |
 | `--n-active-experts` | 2 | Top-k experts active per token |
 | `--router-loss-weight` | 0.01 | Load balancing auxiliary loss coefficient (ignored when `n_experts=1`) |
+| `--effective-tokens-target` | 2^19 | Target tokens for gradient accumulation calculation |
+| `--muon-lr` | 0.02 | Muon optimizer learning rate |
+| `--adamw-lr` | 1e-3 | AdamW optimizer learning rate |
 
-## Inference
+---
+
+## 🔍 Inference
 
 ```bash
 python infer.py --save-dir=models/checkpoint-xxx --prompt "Hello" --use-cache \
@@ -88,69 +183,59 @@ python infer.py --save-dir=models/checkpoint-xxx --prompt "Hello" --use-cache \
 
 Add `--use-cache` to enable KV caching (speeds up autoregressive generation). Throughput is benchmarked automatically.
 
-## Development Notes
+---
 
-- **Data format**: Sharded `.npy` token files referenced via JSON shard list (`data/web_small_10B.json`). `TokenDataset` is an `IterableDataset` that streams examples from these files.
-- **Tokenizer**: Starcoderbase base with custom special tokens added (markdown, code, Jupyter, GitHub markers). Located in `tokenizer/`.
-- **Evaluation**: Hellaswag accuracy is computed at every eval interval via `evaluate_hellaswag()` in `LLMTrainer`.
-- **Logging**: WandB (online/offline) or tensorboard. Logs include loss, perplexity, tokens/sec, iters/sec, and per-optimizer LR tracking.
-- **Weight init**: Xavier normal for Linear, normal for Embedding, ones for RMSNorm. Applied via `model.apply(model.weight_init)` before training.
-- **Flash attention**: Uses `F.scaled_dot_product_attention` with `is_causal=True` when `T > 1`. Falls back to manual softmax attention with causal mask for older PyTorch.
-- **Multi-GPU**: Uses HuggingFace Accelerate with DDP. Gradient accumulation is auto-computed from `effective_tokens_target`.
+## 📊 Evaluation
 
-## TODO
+The training loop automatically evaluates:
 
-### Completed
+- **Perplexity** on the validation set at each eval interval
+- **HellaSwag accuracy** via `evaluate_hellaswag()` in `LLMTrainer`
 
-- [x] Started with a Character-level bigram encoder
-- [x] Implemented a base GPT-2 architecture from nanoGPT for character-level modeling
-- [x] HuggingFace model classes (`PreTrainedModel` + `GenerationMixin`) for easy inference with HuggingFace `pipeline` including beam decoding and repetition penalty
-- [x] Accelerate and HuggingFace Trainer for multi-GPU distributed training (DDP) with BF16 / FP8 mixed precision training, Gradient accumulation, etc.
+Logs are sent to WandB (online/offline) or TensorBoard, tracking loss, perplexity, tokens/sec, iters/sec, per-optimizer LR, and per-expert load/importance statistics.
+
+---
+
+## 🗺️ Roadmap
+
+### Completed ✅
+
+- [x] Character-level bigram encoder → base GPT-2 architecture (nanoGPT)
+- [x] HuggingFace model classes (`PreTrainedModel` + `GenerationMixin`) with beam decoding and repetition penalty
+- [x] Accelerate + HuggingFace Trainer for multi-GPU DDP training with BF16 mixed precision, gradient accumulation
 - [x] WandB + TensorBoard logging
 - [x] Flash attention (`F.scaled_dot_product_attention`)
-- [x] Used Starcoderbase tokenizer with custom special tokens for sub-word Language Modeling
-- [x] Custom dataset of 100B tokens (sharded `.npy` files) for training (contains Fineweb-edu, Redpajama-Github, Cosmopedia, and OpenWeb-math with approx 40-25-20-15 mixing fractions)
-- [x] Smaller 10B token dataset for debugging and testing with Fineweb-edu
+- [x] Starcoderbase tokenizer with custom special tokens for sub-word language modeling
+- [x] Custom dataset of 100B tokens (Fineweb-edu, Redpajama-Github, Cosmopedia, OpenWeb-math)
 - [x] Sharded dataset support (`IterableDataset`)
-- [x] Hybrid Muon optimizer (for 2D params) and AdamW (for 1D params)
+- [x] Hybrid Muon optimizer (2D params) + AdamW (1D params)
 - [x] 3-phase LR schedule (warmup → cosine decay → constant plateau)
-- [x] Weight initialization
-- [x] Rotary Positional Embeddings (RoPE)
-- [x] KV Cache
-- [x] RMS Norm (replacing LayerNorm)
+- [x] Weight initialization, RoPE, KV Cache, RMSNorm
 - [x] Gated Linear Unit (GLU) activation (SqReLU / SwiGLU)
 - [x] HellaSwag evaluation
-- [x] Grouped-Query Attention (GQA) instead of standard multi-head attention
-- [x] Updated attention to Multi-headed Latent Attention (MLA) along with DeepSeek-style RoPE embeddings
+- [x] Multi-Headed Latent Attention (MLA) with DeepSeek-style RoPE
 - [x] Mixture of Experts (MoE) — sparse top-k routing with load balancing auxiliary loss
+- [x] MLP/MoE toggle — `--n-experts=1` for plain MLP, `n_experts > 1` for MoE
 
-### Training: Architecture Innovations
+### Planned 🚧
 
-- [ ] **Sparse attention via token clustering** — Group every N tokens (e.g. 8) and attend only to representative cluster centroids, reducing attention complexity from O(T²) to O(T·C) where C << T.
-- [ ] **Linear attention / State Space Models** — Replace softmax attention with SSM-based mixing (e.g. RWKV, Mamba-style) for O(T) sequence complexity. Consider Hyena operator or RetNet-style recurrence as alternatives.
-- [ ] **Engrams** — Add a learnable external memory bank (key-value store) that the model can read from/write to during generation. Enables long-range information retrieval beyond the context window.
-- [ ] **Hyper connections (residual gating)** — Add learnable residual paths (similar to mHC / hypernetwork-style gating) that let the model dynamically route information across layers, improving gradient flow and expressivity.
+- [ ] **Sparse attention via token clustering** — Group every N tokens and attend only to representative cluster centroids, reducing attention from O(T²) to O(T·C).
+- [ ] **Linear attention / State Space Models** — Replace softmax attention with SSM-based mixing (RWKV, Mamba-style) for O(T) sequence complexity.
+- [ ] **Engrams** — Learnable external memory bank (key-value store) for long-range information retrieval beyond the context window.
+- [ ] **Hyper connections (residual gating)** — Learnable residual paths that let the model dynamically route information across layers.
+- [ ] **Supervised fine-tuning (SFT)** — Instruction-following training pipeline with formatted prompt templates.
+- [ ] **RLHF / DPO / GRPO** — Preference optimization without a separate reward model.
+- [ ] **LoRA** — Low-rank adaptation for efficient fine-tuning.
+- [ ] **RAG integration** — Vector database integration for external knowledge retrieval.
+- [ ] **vLLM serving** — High-throughput inference with PagedAttention and continuous batching.
+- [ ] **Quantization** — INT8/INT4/GGUF for deployment on consumer GPUs.
 
-### Inference: Fine-Tuning & Alignment
+---
 
-- [ ] **Supervised fine-tuning (SFT / instruct)** — Training pipeline for instruction-following datasets ( Alpaca, UltraChat, etc.). Add formatted prompt templates and supervised loss on response tokens.
-- [ ] **RLHF (Reinforcement Learning from Human Feedback)** — PPO-based reward modeling and policy optimization on top of the SFT model. Requires a separate reward model and reference policy.
-- [ ] **RLVR (Reinforcement Learning from Verifiable Rewards)** — Use deterministic verification signals (code execution, math solutions) as rewards instead of human preferences. Cheaper and more reliable for technical domains.
-- [ ] **DPO (Direct Preference Optimization)** — Pairwise preference optimization without a separate reward model. Simpler than PPO, trains directly on preference pairs (chosen vs rejected).
-- [ ] **GRPO (Group Relative Policy Optimization)** — Group-based RL optimization from the R1 paper. Normalize rewards within a group of responses, eliminating the need for a critic/reward model.
-
-### Inference: Parameter-Efficient Fine-Tuning
-
-- [ ] **LoRA (Low-Rank Adaptation)** — Inject low-rank decomposition matrices into attention and FFN layers. Enables fine-tuning large models with minimal memory (only train ~1% of parameters). Include rank selection, alpha scaling, and dropout.
-- [ ] **LoRA inference integration** — Merge trained LoRA weights back into the base model for deployment, or implement runtime LoRA switching for multi-task models.
-
-### Deployment & Integration
-
-- [ ] **RAG (Retrieval-Augmented Generation)** — Vector database integration (e.g., FAISS, Chroma) for external knowledge retrieval at inference time. Combine with the model's parametric knowledge to reduce hallucinations and enable up-to-date responses without retraining.
-- [ ] **vLLM integration** — Optimize inference pipeline with vLLM's PagedAttention and continuous batching. Enable high-throughput serving with Tensor Parallelism.
-- [ ] **OpenCode / OpenClaw agent integration** — Package the trained model for use in agent frameworks. Provide API endpoints (REST/gRPC) and structured prompt templates for tool-use and code-generation tasks.
-- [ ] **Deployable model for local GPU inference** — Quantization (INT8/INT4/GGUF), ONNX export, and benchmarking for deployment on consumer GPUs.
-
-## License
+## 📝 License
 
 [CC0-1.0](LICENSE) — Creative Commons Zero v1.0 Universal
+
+---
+
+> **Built with ❤️ for the open-source ML community.** Inspired by [nanoGPT](https://github.com/karpathy/nanoGPT).
