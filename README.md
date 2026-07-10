@@ -36,9 +36,10 @@ train.py / infer.py          ← Entry points
 model/
   config.py                  ← ModelConfig (transformers PreTrainedConfig)
   model.py                   ← Model (PreTrainedModel + GenerationMixin)
-  layer.py                   ← Block (MLA + FFN/MoE with residual connections)
+  layer.py                   ← Block (MLA + FFN/MoE + mHC with residual connections)
   attention.py               ← MultiHeadedLatentAttention (MLA core)
   feed_forward.py            ← FeedForward (SwiGLU / GELU / SqReLU) + MoE (top-k routing)
+  hyper_connections.py       ← MHCRouter (hyper-connection routing with Sinkhorn-Knopp)
 utils/
   data_utils.py              ← TokenDataset (IterableDataset), HellaswagDataset
   train_utils.py             ← LLMTrainer (HuggingFace Trainer subclass)
@@ -68,6 +69,12 @@ Input Embedding
 │   ┌─────────────┐    ┌────────────┐   │
 │   │ RMSNorm  ──►│───►│ FFN / MoE  │   │
 │   └─────────────┘    └────────────┘   │
+│              ▲          │             │
+│              │     residual           │
+│              │          ▼             │
+│   ┌────────────────────────────────┐  │
+│   │      mHC Router (Sinkhorn)     │  │
+│   └────────────────────────────────┘  │
 └───────────────────────────────────────┘
        │
        ▼
@@ -82,6 +89,7 @@ Input Embedding
 - **MLA Attention** — K and V projections share a latent bottleneck (`kv_latent_dim`). K is split into nope (up-projected via `k_up`) and rope components; V is up-projected via `v_up`. Q is split into nope + rope. RoPE is applied only to the rope components. This is the core memory-saving innovation.
 - **Block structure**: Pre-norm RMSNorm → MLA → residual → RMSNorm → FFN → residual. The FFN is either a plain MLP (when `n_experts=1`) or a sparse MoE (when `n_experts>1`). Gated SwiGLU or standard activation.
 - **MoE** — Each FFN layer is replaced by a sparse Mixture-of-Experts with top-k gating. Load balancing auxiliary loss (MSE between expert load/importance and uniform) is tracked and added to the total loss via `router_loss_coef`.
+- **Hyper-connections (mHC)** — Each layer has a learnable multi-stream routing mechanism (`MHCRouter`) that expands the input into `num_residual_streams` parallel streams. Each stream goes through its own MLA + FFN path, and streams are mixed via Sinkhorn-Knopp soft attention before being collapsed back. Uses learnable pre-mixing (`h_pre`), post-mixing (`h_post`), and residual mixing (`h_res`) parameters.
 - **Dual optimizer** — Muon optimizer for 2D+ parameters (weights), AdamW for 1D params (biases, embeddings). Separate LR schedules: Muon gets warmup → cosine decay → constant plateau; AdamW gets the same 3-phase schedule.
 
 </details>
@@ -168,6 +176,7 @@ accelerate launch --num_processes=8 --mixed_precision=bf16 train.py --use-bf16 -
 | `--n-experts` | 8 | Number of MoE experts per layer (**1 = plain MLP**) |
 | `--n-active-experts` | 2 | Top-k experts active per token |
 | `--router-loss-weight` | 0.01 | Load balancing auxiliary loss coefficient (ignored when `n_experts=1`) |
+| `--n-res-streams` | 4 | Number of residual streams for mHC routing |
 | `--effective-tokens-target` | 2^19 | Target tokens for gradient accumulation calculation |
 | `--muon-lr` | 0.02 | Muon optimizer learning rate |
 | `--adamw-lr` | 1e-3 | AdamW optimizer learning rate |
@@ -216,13 +225,13 @@ Logs are sent to WandB (online/offline) or TensorBoard, tracking loss, perplexit
 - [x] Multi-Headed Latent Attention (MLA) with DeepSeek-style RoPE
 - [x] Mixture of Experts (MoE) — sparse top-k routing with load balancing auxiliary loss
 - [x] MLP/MoE toggle — `--n-experts=1` for plain MLP, `n_experts > 1` for MoE
+- [x] Hyper-connections (mHC) — learnable multi-stream routing with Sinkhorn-Knopp attention
 
 ### Planned 🚧
 
 - [ ] **Sparse attention via token clustering** — Group every N tokens and attend only to representative cluster centroids, reducing attention from O(T²) to O(T·C).
 - [ ] **Linear attention / State Space Models** — Replace softmax attention with SSM-based mixing (RWKV, Mamba-style) for O(T) sequence complexity.
 - [ ] **Engrams** — Learnable external memory bank (key-value store) for long-range information retrieval beyond the context window.
-- [ ] **Hyper connections (residual gating)** — Learnable residual paths that let the model dynamically route information across layers.
 - [ ] **Supervised fine-tuning (SFT)** — Instruction-following training pipeline with formatted prompt templates.
 - [ ] **RLHF / DPO / GRPO** — Preference optimization without a separate reward model.
 - [ ] **LoRA** — Low-rank adaptation for efficient fine-tuning.
