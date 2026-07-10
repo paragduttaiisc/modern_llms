@@ -5,7 +5,7 @@ from rotary_embedding_torch import RotaryEmbedding
 from typing import Optional, Tuple
 
 from .attention import MultiHeadedLatentAttention as Attention
-from .feed_forward import MoE
+from .feed_forward import FeedForward as MLP, MoE
 
 
 class Block(nn.Module):
@@ -33,14 +33,22 @@ class Block(nn.Module):
             block_size=block_size,
             dropout=dropout
         )
-        self.moe = MoE(
-            n_embed=embedding_size,
-            hidden_size=ff_hidden_size,
-            n_experts=n_experts,
-            top_k=n_active_experts,
-            activation=activation,
-            dropout=dropout
-        )
+        if n_experts == 1:
+            self.ffn = MLP(
+                n_embed=embedding_size,
+                hidden_size=ff_hidden_size,
+                activation=activation,
+                dropout=dropout,
+            )
+        else:
+            self.ffn = MoE(
+                n_embed=embedding_size,
+                hidden_size=ff_hidden_size,
+                n_experts=n_experts,
+                top_k=n_active_experts,
+                activation=activation,
+                dropout=dropout,
+            )
         self.rms_norm1 = nn.RMSNorm(embedding_size, eps=1e-6)
         self.rms_norm2 = nn.RMSNorm(embedding_size, eps=1e-6)
     
@@ -60,6 +68,6 @@ class Block(nn.Module):
             layer_idx
         )
         x = x + attention_outputs
-        router_outputs, router_loss = self.moe(self.rms_norm2(x))
+        router_outputs, router_loss = self.ffn(self.rms_norm2(x))
         x = x + router_outputs
         return x, router_loss

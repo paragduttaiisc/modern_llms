@@ -31,6 +31,9 @@ class FeedForward(nn.Module):
         x = self.down_proj(x)
         return self.dropout(x)
 
+    def __call__(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.forward(x), torch.zeros((), device=x.device, dtype=x.dtype)
+
 
 class MoE(nn.Module):
     def __init__(
@@ -106,7 +109,7 @@ class MoE(nn.Module):
             if token_idx.numel() == 0:
                 continue
             expert_input = x_flat[token_idx]
-            expert_output = expert(expert_input).to(out.dtype)
+            expert_output = expert.forward(expert_input).to(out.dtype)
             expert_output *= flat_weights[token_idx, kth].unsqueeze(-1)
             out.index_add_(0, token_idx, expert_output)
         out = out.view(B, T, C)

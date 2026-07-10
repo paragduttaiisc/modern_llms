@@ -9,7 +9,7 @@ train.py / infer.py          ← Entry points
 model/
   config.py                  ← ModelConfig (transformers PreTrainedConfig)
   model.py                   ← Model (PreTrainedModel + GenerationMixin)
-  layer.py                   ← Block (MLA + MoE with residual connections)
+  layer.py                   ← Block (MLA + FFN/MoE with residual connections)
   attention.py               ← MultiHeadedLatentAttention (MLA core)
   feed_forward.py            ← FeedForward (SwiGLU / GELU / SqReLU) + MoE (top-k routing)
 utils/
@@ -24,8 +24,8 @@ data -> /home/parag/Data/llm_data   ← Symlink to shard data
 ### Key architectural details
 
 - **MLA Attention** ([attention.py](model/attention.py)): K and V projections share a latent bottleneck (`kv_latent_dim`). K is split into nope (up-projected via `k_up`) and rope components; V is up-projected via `v_up`. Q is split into nope + rope. RoPE is applied only to the rope components. This is the core memory-saving innovation.
-- **Block structure**: Pre-norm RMSNorm → MLA → residual → RMSNorm → MoE → residual. Gated SwiGLU or standard activation in FFN.
-- **MoE** ([feed_forward.py](model/feed_forward.py)): Each FFN layer is replaced by a sparse Mixture-of-Experts with top-k gating. Load balancing auxiliary loss (MSE between expert load/importance and uniform) is tracked and added to the total loss via `router_loss_coef`.
+- **Block structure**: Pre-norm RMSNorm → MLA → residual → RMSNorm → FFN → residual. The FFN is either a plain MLP (when `n_experts=1`) or a sparse MoE (when `n_experts>1`). Gated SwiGLU or standard activation.
+- **MoE / MLP** ([feed_forward.py](model/feed_forward.py)): Each FFN layer is either a sparse Mixture-of-Experts with top-k gating (when `n_experts > 1`) or a plain MLP (when `n_experts == 1`). The MoE load balancing auxiliary loss (MSE between expert load/importance and uniform) is tracked and added to the total loss via `router_loss_coef`. When using an MLP, the router loss is zero.
 - **Dual optimizer**: Muon optimizer for 2D+ parameters (weights), AdamW for 1D params (biases, embeddings). Separate LR schedules: Muon gets warmup → cosine decay → constant plateau; AdamW gets the same 3-phase schedule.
 
 ## Getting Started
@@ -44,9 +44,15 @@ pip install -r requirements.txt
 ## Training
 
 ```bash
-# Single GPU / debug
+# Single GPU / debug (MoE)
 accelerate launch train.py --use-bf16 --batch-size=24 --n-layers=12 --n-heads=12 \
     --block-size=2048 --n-iters=25400 --save-dir=models/your_model
+
+# Plain MLP (n_experts=1)
+accelerate launch --num_processes=8 --mixed_precision=bf16 train.py --use-bf16 --n-experts=1 \
+    --router-loss-weight=0.0 --batch-size=16 --n-iters=38140 --warmup-iters=500 \
+    --last-decay-iter=37000 --eval-interval=1000 --save-interval=5000 \
+    --wandb-run-name="<RunName>"
 
 # Multi-GPU (SLURM via run.sh)
 sbatch run.sh
@@ -69,9 +75,9 @@ The SLURM script (`run.sh`) is configured for 4 H200 GPUs with bf16, batch=80, a
 | `--effective-tokens-target` | 2^19 | Target tokens for grad accum calc |
 | `--muon-lr` | 0.02 | Muon optimizer LR |
 | `--adamw-lr` | 1e-3 | AdamW optimizer LR |
-| `--n-experts` | 12 | Number of MoE experts per layer |
-| `--n-active-experts` | 3 | Top-k experts active per token |
-| `--router-loss-weight` | 0.01 | Load balancing auxiliary loss coefficient |
+| `--n-experts` | 8 | Number of MoE experts per layer (1 = plain MLP) |
+| `--n-active-experts` | 2 | Top-k experts active per token |
+| `--router-loss-weight` | 0.01 | Load balancing auxiliary loss coefficient (ignored when `n_experts=1`) |
 
 ## Inference
 

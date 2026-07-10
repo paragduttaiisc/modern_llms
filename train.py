@@ -106,7 +106,7 @@ def main(args: argparse.Namespace):
         project=args.wandb_project,
         max_grad_norm=args.max_grad_norm,
         dataloader_num_workers=args.num_workers,
-        ddp_find_unused_parameters=True,
+        ddp_find_unused_parameters=args.n_experts > 1,
         report_to="wandb" if args.wandb_run_name else\
             "none" if args.dont_log else "tensorboard",
     )
@@ -142,9 +142,9 @@ if __name__ == "__main__":
     parser.add_argument("--attn-head-size", type=int, default=64)
     parser.add_argument("--rope-size", type=int, default=16)
     parser.add_argument("--embed-size", type=int, default=768)
-    parser.add_argument("--mlp-hidden-size", type=int, default=1536)
-    parser.add_argument("--n-experts", type=int, default=12)
-    parser.add_argument("--n-active-experts", type=int, default=3)
+    parser.add_argument("--mlp-hidden-size", type=int, default=3072)
+    parser.add_argument("--n-experts", type=int, default=8)
+    parser.add_argument("--n-active-experts", type=int, default=2)
     parser.add_argument("--kv-latent-size", type=int, default=128)
     parser.add_argument("--non-linearity", type=str, default="SqReLU", choices=["GELU", "SwiGLU", "SqReLU"])
     parser.add_argument("--grad-accum-steps", type=int, default=-1)
@@ -164,7 +164,7 @@ if __name__ == "__main__":
     parser.add_argument("--warmup-iters", type=int, default=750)
     parser.add_argument("--last-decay-iter", type=int, default=72000)
     parser.add_argument("--log-interval", type=int, default=10)
-    parser.add_argument("--eval-interval", type=int, default=2000)
+    parser.add_argument("--eval-interval", type=int, default=1000)
     parser.add_argument("--save-interval", type=int, default=10000)
     parser.add_argument("--use-bf16", action="store_true")
     parser.add_argument("--dont-log", action="store_true")
