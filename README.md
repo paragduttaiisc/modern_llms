@@ -9,9 +9,9 @@ train.py / infer.py          ← Entry points
 model/
   config.py                  ← ModelConfig (transformers PreTrainedConfig)
   model.py                   ← Model (PreTrainedModel + GenerationMixin)
-  layer.py                   ← Block (MLA + FeedForward with residual connections)
+  layer.py                   ← Block (MLA + MoE with residual connections)
   attention.py               ← MultiHeadedLatentAttention (MLA core)
-  feed_forward.py            ← FeedForward (SwiGLU / GELU / SqReLU)
+  feed_forward.py            ← FeedForward (SwiGLU / GELU / SqReLU) + MoE (top-k routing)
 utils/
   data_utils.py              ← TokenDataset (IterableDataset), HellaswagDataset
   train_utils.py             ← LLMTrainer (HuggingFace Trainer subclass)
@@ -24,7 +24,8 @@ data -> /home/parag/Data/llm_data   ← Symlink to shard data
 ### Key architectural details
 
 - **MLA Attention** ([attention.py](model/attention.py)): K and V projections share a latent bottleneck (`kv_latent_dim`). K is split into nope (up-projected via `k_up`) and rope components; V is up-projected via `v_up`. Q is split into nope + rope. RoPE is applied only to the rope components. This is the core memory-saving innovation.
-- **Block structure**: Pre-norm RMSNorm → MLA → residual → RMSNorm → FeedForward → residual. Gated SwiGLU or standard activation in FFN.
+- **Block structure**: Pre-norm RMSNorm → MLA → residual → RMSNorm → MoE → residual. Gated SwiGLU or standard activation in FFN.
+- **MoE** ([feed_forward.py](model/feed_forward.py)): Each FFN layer is replaced by a sparse Mixture-of-Experts with top-k gating. Load balancing auxiliary loss (MSE between expert load/importance and uniform) is tracked and added to the total loss via `router_loss_coef`.
 - **Dual optimizer**: Muon optimizer for 2D+ parameters (weights), AdamW for 1D params (biases, embeddings). Separate LR schedules: Muon gets warmup → cosine decay → constant plateau; AdamW gets the same 3-phase schedule.
 
 ## Getting Started
@@ -68,6 +69,9 @@ The SLURM script (`run.sh`) is configured for 4 H200 GPUs with bf16, batch=80, a
 | `--effective-tokens-target` | 2^19 | Target tokens for grad accum calc |
 | `--muon-lr` | 0.02 | Muon optimizer LR |
 | `--adamw-lr` | 1e-3 | AdamW optimizer LR |
+| `--n-experts` | 12 | Number of MoE experts per layer |
+| `--n-active-experts` | 3 | Top-k experts active per token |
+| `--router-loss-weight` | 0.01 | Load balancing auxiliary loss coefficient |
 
 ## Inference
 
@@ -112,19 +116,14 @@ Add `--use-cache` to enable KV caching (speeds up autoregressive generation). Th
 - [x] HellaSwag evaluation
 - [x] Grouped-Query Attention (GQA) instead of standard multi-head attention
 - [x] Updated attention to Multi-headed Latent Attention (MLA) along with DeepSeek-style RoPE embeddings
+- [x] Mixture of Experts (MoE) — sparse top-k routing with load balancing auxiliary loss
 
 ### Training: Architecture Innovations
 
-- [ ] **Mixture of Experts (MoE)** — Replace dense FFN with sparse MoE FFN (top-k routing) to increase parameter count without increasing per-token compute. Enables scaling to 10B+ with fixed FLOPs.
 - [ ] **Sparse attention via token clustering** — Group every N tokens (e.g. 8) and attend only to representative cluster centroids, reducing attention complexity from O(T²) to O(T·C) where C << T.
 - [ ] **Linear attention / State Space Models** — Replace softmax attention with SSM-based mixing (e.g. RWKV, Mamba-style) for O(T) sequence complexity. Consider Hyena operator or RetNet-style recurrence as alternatives.
 - [ ] **Engrams** — Add a learnable external memory bank (key-value store) that the model can read from/write to during generation. Enables long-range information retrieval beyond the context window.
 - [ ] **Hyper connections (residual gating)** — Add learnable residual paths (similar to mHC / hypernetwork-style gating) that let the model dynamically route information across layers, improving gradient flow and expressivity.
-
-<!-- ### Training: Next-Gen Model Paradigms
-
-- [ ] **Diffusion Language Models** — Shift from autoregressive (causal) LM to non-autoregressive diffusion over tokens. Sample all positions in parallel; denoising process replaces next-token prediction. Enables better mode coverage and avoids error accumulation.
-- [ ] **Neural Operator token mixing** — Replace transformer attention with neural operator layers (e.g. FNO / DeepONet style) for continuous-domain token mixing. More expressive than attention for certain patterns; scales sub-quadratically with sequence length. -->
 
 ### Inference: Fine-Tuning & Alignment
 
