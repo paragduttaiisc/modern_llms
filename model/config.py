@@ -9,7 +9,8 @@ class ModelConfig(PreTrainedConfig):
             vocab_size: int = 65,
             block_size: int = 256,
             embedding_size: int = 384,
-            head_size: int = 64,
+            sa_head_size: int = 64,
+            ff_hidden_size: int = 1536,
             experts: int = 8,
             active_experts: int = 2,
             router_loss_coef: float = 0.01,
@@ -28,7 +29,8 @@ class ModelConfig(PreTrainedConfig):
         self.non_linearity = non_linearity
         self.num_hidden_layers = num_hidden_layers
         self.embedding_size = embedding_size
-        self.head_size = head_size
+        self.sa_head_size = sa_head_size
+        self.ff_hidden_size = ff_hidden_size
         self.experts = experts
         self.active_experts = active_experts
         self.router_loss_coef = router_loss_coef

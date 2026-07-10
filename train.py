@@ -55,15 +55,16 @@ def main(args: argparse.Namespace):
     )
     if accelerator.is_main_process:
         print("Tokenizer vocab size:", hrn(tokenizer.vocab_size))
-        print("Num_tokens in trainset:", hrn(int(len(trainset.shard_paths) * 2e7)))
-        print("Num_tokens in valset:", hrn(int(len(valset.shard_paths) * 2e7)))
+        print("Num tokens in trainset:", hrn(int(len(trainset.shard_paths) * 2e7)))
+        print("Num tokens in valset:", hrn(int(len(valset.shard_paths) * 2e7)))
 
     # create model and optimizer
     model = Model(ModelConfig(
         vocab_size=args.vocab_size,
         block_size=args.block_size,
         embedding_size=args.embed_size,
-        head_size=args.head_size,
+        sa_head_size=args.attn_head_size,
+        ff_hidden_size=args.mlp_hidden_size,
         rope_size=args.rope_size,
         kv_latent_size=args.kv_latent_size,
         num_hidden_layers=args.n_layers,
@@ -138,13 +139,14 @@ if __name__ == "__main__":
     parser.add_argument("--block-size", type=int, default=2048)
     parser.add_argument("--n-layers", type=int, default=12)
     parser.add_argument("--n-heads", type=int, default=12)
-    parser.add_argument("--head-size", type=int, default=64)
+    parser.add_argument("--attn-head-size", type=int, default=64)
     parser.add_argument("--rope-size", type=int, default=16)
     parser.add_argument("--embed-size", type=int, default=768)
-    parser.add_argument("--n-experts", type=int, default=8)
-    parser.add_argument("--n-active-experts", type=int, default=2)
+    parser.add_argument("--mlp-hidden-size", type=int, default=1536)
+    parser.add_argument("--n-experts", type=int, default=12)
+    parser.add_argument("--n-active-experts", type=int, default=3)
     parser.add_argument("--kv-latent-size", type=int, default=128)
-    parser.add_argument("--non-linearity", type=str, default="SwiGLU", choices=["GELU", "SwiGLU", "SqReLU"])
+    parser.add_argument("--non-linearity", type=str, default="SqReLU", choices=["GELU", "SwiGLU", "SqReLU"])
     parser.add_argument("--grad-accum-steps", type=int, default=-1)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--adamw-lr", type=float, default=1e-3)

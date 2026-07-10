@@ -5,11 +5,10 @@ from typing import Tuple
 
 
 class FeedForward(nn.Module):
-    def __init__(self, n_embed: int, activation: str, dropout: float) -> None:
+    def __init__(self, n_embed: int, hidden_size: int, activation: str, dropout: float) -> None:
         super().__init__()
         assert activation in ["GELU", "SwiGLU", "SqReLU"],\
             "Unsupported activation"
-        hidden_size = 4 * n_embed
         self.act = nn.GELU(approximate="tanh") if activation == "GELU"\
                     else lambda x: F.relu(x).square()
         self.forward = self._forward_standard
@@ -37,6 +36,7 @@ class MoE(nn.Module):
     def __init__(
         self,
         n_embed: int,
+        hidden_size: int,
         n_experts: int = 8,
         top_k: int = 2,
         activation: str = "SwiGLU",
@@ -51,6 +51,7 @@ class MoE(nn.Module):
         self.experts = nn.ModuleList([
             FeedForward(
                 n_embed=n_embed,
+                hidden_size=hidden_size,
                 activation=activation,
                 dropout=dropout,
             )

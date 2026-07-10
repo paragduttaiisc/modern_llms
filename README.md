@@ -121,10 +121,10 @@ Add `--use-cache` to enable KV caching (speeds up autoregressive generation). Th
 - [ ] **Engrams** — Add a learnable external memory bank (key-value store) that the model can read from/write to during generation. Enables long-range information retrieval beyond the context window.
 - [ ] **Hyper connections (residual gating)** — Add learnable residual paths (similar to mHC / hypernetwork-style gating) that let the model dynamically route information across layers, improving gradient flow and expressivity.
 
-### Training: Next-Gen Model Paradigms
+<!-- ### Training: Next-Gen Model Paradigms
 
 - [ ] **Diffusion Language Models** — Shift from autoregressive (causal) LM to non-autoregressive diffusion over tokens. Sample all positions in parallel; denoising process replaces next-token prediction. Enables better mode coverage and avoids error accumulation.
-- [ ] **Neural Operator token mixing** — Replace transformer attention with neural operator layers (e.g. FNO / DeepONet style) for continuous-domain token mixing. More expressive than attention for certain patterns; scales sub-quadratically with sequence length.
+- [ ] **Neural Operator token mixing** — Replace transformer attention with neural operator layers (e.g. FNO / DeepONet style) for continuous-domain token mixing. More expressive than attention for certain patterns; scales sub-quadratically with sequence length. -->
 
 ### Inference: Fine-Tuning & Alignment
 
@@ -133,7 +133,6 @@ Add `--use-cache` to enable KV caching (speeds up autoregressive generation). Th
 - [ ] **RLVR (Reinforcement Learning from Verifiable Rewards)** — Use deterministic verification signals (code execution, math solutions) as rewards instead of human preferences. Cheaper and more reliable for technical domains.
 - [ ] **DPO (Direct Preference Optimization)** — Pairwise preference optimization without a separate reward model. Simpler than PPO, trains directly on preference pairs (chosen vs rejected).
 - [ ] **GRPO (Group Relative Policy Optimization)** — Group-based RL optimization from the R1 paper. Normalize rewards within a group of responses, eliminating the need for a critic/reward model.
-- [ ] **Self-improvement (SLF-Improvement)** — Iterative self-training: generate responses, self-evaluate, refine. Enables post-training improvement without external data.
 
 ### Inference: Parameter-Efficient Fine-Tuning
 

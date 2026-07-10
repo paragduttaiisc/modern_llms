@@ -12,7 +12,8 @@ class Block(nn.Module):
     def __init__(
             self,
             embedding_size: int,
-            head_size: int,
+            sa_head_size: int,
+            ff_hidden_size: int,
             n_experts: int,
             n_active_experts: int,
             rope_size: int,
@@ -26,7 +27,7 @@ class Block(nn.Module):
         self.sa_heads = Attention(
             num_heads=num_attn_heads,
             embed_dim=embedding_size,
-            head_dim=head_size,
+            head_dim=sa_head_size,
             rope_dim=rope_size,
             kv_latent_dim=kv_latent_size,
             block_size=block_size,
@@ -34,6 +35,7 @@ class Block(nn.Module):
         )
         self.moe = MoE(
             n_embed=embedding_size,
+            hidden_size=ff_hidden_size,
             n_experts=n_experts,
             top_k=n_active_experts,
             activation=activation,

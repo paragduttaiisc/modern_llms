@@ -29,7 +29,8 @@ class Model(PreTrainedModel, GenerationMixin):
         self.layers = nn.ModuleList([
             Block(
                 embedding_size=config.embedding_size,
-                head_size=config.head_size,
+                sa_head_size=config.sa_head_size,
+                ff_hidden_size=config.ff_hidden_size,
                 n_experts=config.experts,
                 n_active_experts=config.active_experts,
                 rope_size=config.rope_size,
