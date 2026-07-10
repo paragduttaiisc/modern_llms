@@ -4,6 +4,7 @@ from transformers.cache_utils import Cache
 from rotary_embedding_torch import RotaryEmbedding
 from typing import Optional, Tuple
 
+from .hyper_connections import MHCRouter
 from .attention import MultiHeadedLatentAttention as Attention
 from .feed_forward import FeedForward as MLP, MoE
 
@@ -19,6 +20,7 @@ class Block(nn.Module):
             rope_size: int,
             kv_latent_size: int,
             num_attn_heads: int,
+            num_residual_streams: int,
             block_size: int,
             activation: str,
             dropout: float,
@@ -51,6 +53,9 @@ class Block(nn.Module):
             )
         self.rms_norm1 = nn.RMSNorm(embedding_size, eps=1e-6)
         self.rms_norm2 = nn.RMSNorm(embedding_size, eps=1e-6)
+
+        self.attn_mhc = MHCRouter(n_streams=num_residual_streams)
+        self.ffn_mhc = MHCRouter(n_streams=num_residual_streams)
     
     def forward(
             self,
@@ -59,15 +64,14 @@ class Block(nn.Module):
             past_key_values: Optional[Cache] = None,
             past_length: Optional[int] = 0,
             layer_idx: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        attention_outputs = self.sa_heads(
-            self.rms_norm1(x),
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        x = self.attn_mhc(x, self.sa_heads(
+            self.rms_norm1(self.attn_mhc.collapse(x)),
             rotary_emb,
             past_key_values,
             past_length,
             layer_idx
-        )
-        x = x + attention_outputs
-        router_outputs, router_loss = self.ffn(self.rms_norm2(x))
-        x = x + router_outputs
-        return x, router_loss
+        ))
+        router_output = self.ffn(self.rms_norm2(self.ffn_mhc.collapse(x)))
+        x = self.ffn_mhc(x, router_output.value)
+        return x, router_output.loss

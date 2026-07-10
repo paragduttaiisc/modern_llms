@@ -1,7 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple
+from typing import NamedTuple, Optional
+
+
+class MLPOutput(NamedTuple):
+    value: torch.Tensor
+    loss: Optional[torch.Tensor] = None
 
 
 class FeedForward(nn.Module):
@@ -31,8 +36,8 @@ class FeedForward(nn.Module):
         x = self.down_proj(x)
         return self.dropout(x)
 
-    def __call__(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.forward(x), torch.zeros((), device=x.device, dtype=x.dtype)
+    def __call__(self, x: torch.Tensor) -> MLPOutput:
+        return MLPOutput(value=self.forward(x))
 
 
 class MoE(nn.Module):
@@ -66,10 +71,7 @@ class MoE(nn.Module):
         self.last_aux_loss = None
         self.last_num_tokens = None
 
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> MLPOutput:
 
         B, T, C = x.shape
 
@@ -114,4 +116,4 @@ class MoE(nn.Module):
             out.index_add_(0, token_idx, expert_output)
         out = out.view(B, T, C)
 
-        return out, aux_loss
+        return MLPOutput(value=out, loss=aux_loss)

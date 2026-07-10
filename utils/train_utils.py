@@ -219,7 +219,7 @@ class LLMTrainer(Trainer):
                         (tokens_passed / self.block_size) / elapsed
                     if hasattr(self.model, "last_lm_loss"):
                         logs["lm_loss"] = self.model.last_lm_loss.item() # type: ignore
-                    if hasattr(self.model, "last_router_loss"):
+                    if hasattr(self.model, "last_router_loss") and self.model.last_router_loss: # type: ignore
                         logs["router_loss"] = self.model.last_router_loss.item() # type: ignore
                     if getattr(self.model.config, "experts", 1) > 1: # type: ignore
                         avg_load = torch.stack([layer.ffn.last_load.float() for layer in self.model.layers]).mean(0) # type: ignore

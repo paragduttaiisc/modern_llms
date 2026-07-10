@@ -36,6 +36,7 @@ class Model(PreTrainedModel, GenerationMixin):
                 rope_size=config.rope_size,
                 kv_latent_size=config.kv_latent_size,
                 num_attn_heads=config.num_attention_heads,
+                num_residual_streams=config.num_residual_streams,
                 block_size=config.block_size,
                 activation=config.non_linearity,
                 dropout=config.dropout,
@@ -113,8 +114,11 @@ class Model(PreTrainedModel, GenerationMixin):
             else getattr(self.config, "use_cache", True)
         
         x = self.emb_drop(self.tok_emb_table(input_ids))
-
         x = x.to(next(self.parameters()).dtype)
+
+        num_residual_streams = self.config.num_residual_streams
+        if num_residual_streams > 1:
+            x = x.unsqueeze(2).repeat(1, 1, num_residual_streams, 1)
 
         past_length = past_key_values.get_seq_length()\
             if past_key_values is not None else 0
@@ -128,8 +132,12 @@ class Model(PreTrainedModel, GenerationMixin):
                 past_length=past_length,
                 layer_idx=i,
             )
-            aux_loss += router_loss
-        aux_loss /= len(self.layers)
+            if router_loss:
+                aux_loss += router_loss
+        aux_loss = aux_loss / len(self.layers) if router_loss else None
+
+        if num_residual_streams > 1:
+            x = x.mean(dim=2)
 
         x = self.rms_norm_f(x)
         logits = self.lm_head(x)
@@ -153,14 +161,16 @@ class Model(PreTrainedModel, GenerationMixin):
                 lm_loss = lm_loss.view(B, T)
                 loss = lm_loss.sum(dim=1) / (labels != -100).sum(dim=1).clamp_min(1)
             elif num_items_in_batch is not None:
-                lm_loss = lm_loss.sum() / num_items_in_batch
-                loss = lm_loss + self.config.router_loss_coef * aux_loss
+                loss = lm_loss = lm_loss.sum() / num_items_in_batch
+                if aux_loss:
+                    loss = lm_loss + self.config.router_loss_coef * aux_loss
             else:
-                lm_loss = lm_loss.mean()
-                loss = lm_loss + self.config.router_loss_coef * aux_loss
+                loss = lm_loss = lm_loss.mean()
+                if aux_loss:
+                    loss = lm_loss + self.config.router_loss_coef * aux_loss
 
             self.last_lm_loss = lm_loss.detach()
-            self.last_router_loss = router_loss.detach()
+            self.last_router_loss = aux_loss.detach() if aux_loss else None # type: ignore
 
         return CausalLMOutputWithPast(
             logits=logits,

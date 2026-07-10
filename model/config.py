@@ -18,6 +18,7 @@ class ModelConfig(PreTrainedConfig):
             kv_latent_size: int = 96,
             num_hidden_layers: int = 6,
             num_attention_heads: int = 4,
+            num_residual_streams: int = 4,
             non_linearity: str = "GELU",
             dropout: float = 0.2,
             **kwargs
@@ -37,3 +38,4 @@ class ModelConfig(PreTrainedConfig):
         self.rope_size = rope_size
         self.kv_latent_size = kv_latent_size
         self.num_attention_heads = num_attention_heads
+        self.num_residual_streams = num_residual_streams

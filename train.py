@@ -69,9 +69,10 @@ def main(args: argparse.Namespace):
         kv_latent_size=args.kv_latent_size,
         num_hidden_layers=args.n_layers,
         num_attention_heads=args.n_heads,
+        num_residual_streams=args.n_res_streams,
         experts=args.n_experts,
         active_experts=args.n_active_experts,
-        router_loss_coeff=args.router_loss_weight,
+        router_loss_coef=args.router_loss_weight,
         non_linearity=args.non_linearity,
         dropout=args.dropout,
     ))
@@ -138,6 +139,7 @@ if __name__ == "__main__":
     parser.add_argument("--vocab-size", type=int, default=49216)
     parser.add_argument("--block-size", type=int, default=2048)
     parser.add_argument("--n-layers", type=int, default=12)
+    parser.add_argument("--n-res-streams", type=int, default=4)
     parser.add_argument("--n-heads", type=int, default=12)
     parser.add_argument("--attn-head-size", type=int, default=64)
     parser.add_argument("--rope-size", type=int, default=16)
