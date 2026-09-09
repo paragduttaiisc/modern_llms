@@ -1,17 +1,18 @@
-import os
-import math
-import torch
 import argparse
+import math
+import os
+
+import torch
 from accelerate import Accelerator
-from transformers import set_seed, TrainingArguments
+from transformers import TrainingArguments, set_seed
 
 from model import Model, ModelConfig
 from utils import (
-    TokenDataset,
     LLMTrainer,
+    TokenDataset,
     get_tokenizer,
-    human_readable_numbers as hrn,
 )
+from utils import human_readable_numbers as hrn
 
 
 def main(args: argparse.Namespace):
@@ -40,7 +41,7 @@ def main(args: argparse.Namespace):
         print("Total effective token size:", hrn(effective_token_size))
         print("Gradient accumulation steps:",
               accelerator.gradient_accumulation_steps)
-    
+
     # Prepare data
     tokenizer = get_tokenizer()
     trainset = TokenDataset(
@@ -89,6 +90,7 @@ def main(args: argparse.Namespace):
         output_dir=args.save_dir,
         torch_compile=True,
         use_cache=False,
+        accelerator_config={"dispatch_batches": False},
         max_steps=args.n_iters,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
@@ -135,7 +137,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--shard-list-file", type=str, default="data/web_small_10B.json")
     parser.add_argument("--save-dir", type=str, default="outputs")
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--vocab-size", type=int, default=49216)
     parser.add_argument("--block-size", type=int, default=2048)
     parser.add_argument("--n-layers", type=int, default=12)

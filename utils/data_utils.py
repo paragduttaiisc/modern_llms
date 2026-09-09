@@ -1,16 +1,16 @@
 import json
-import torch
-import numpy as np
-from transformers import AutoTokenizer, PreTrainedTokenizer
-from torch.utils.data._utils.collate import default_collate
 
+import numpy as np
+import torch
 from torch.utils.data import Dataset, IterableDataset
+from torch.utils.data._utils.collate import default_collate
+from transformers import AutoTokenizer, PreTrainedTokenizer
 
 
 def get_tokenizer(tokenizer_path: str = "tokenizer") -> PreTrainedTokenizer:
     try:
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    except Exception as e:
+    except Exception:  # noqa: BLE001
         print("Creating a new tokenizer...")
         tokenizer = AutoTokenizer.from_pretrained("bigcode/starcoderbase")
         SPL_TOKS = [
@@ -19,7 +19,7 @@ def get_tokenizer(tokenizer_path: str = "tokenizer") -> PreTrainedTokenizer:
             "<|issue_comment|>", "<|issue_closed|>", "<|jupyter_start|>",
             "<|jupyter_text|>", "<|jupyter_code|>", "<|jupyter_output|>",
             "<|empty_output|>", "<|commit_before|>", "<|commit_msg|>",
-            "<|commit_after|>", "<|reponame|>", "<|im_start|>", "<|im_end|>"
+            "<|commit_after|>", "<|reponame|>", "<|im_start|>", "<|im_end|>",
             "<|vision_start|>", "<|vision_end|>", "<|image_pad|>",
             "<|video_pad|>", "<|tool_start|>", "<|tool_end|>",
             "<|tool_response_start|>", "<|tool_response_end|>",
@@ -33,28 +33,56 @@ def get_tokenizer(tokenizer_path: str = "tokenizer") -> PreTrainedTokenizer:
 
 class TokenDataset(IterableDataset):
     def __init__(
-            self, shard_list_file: str, block_size: int, subset: str = "train"
+            self,
+            shard_list_file: str,
+            block_size: int,
+            subset: str = "train"
     ) -> None:
         self.block_size = block_size
-        data = json.load(open(shard_list_file, 'r'))
+        with open(shard_list_file, 'r') as f:
+            data = json.load(f)
         self.shard_paths = data[subset]
-    
+
     def __iter__(self):
-        for shard_path in self.shard_paths:
+        worker = torch.utils.data.get_worker_info()
+
+        if torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+            world_size = torch.distributed.get_world_size()
+        else:
+            rank = 0
+            world_size = 1
+
+        if worker is None:
+            worker_id = 0
+            num_workers = 1
+        else:
+            worker_id = worker.id
+            num_workers = worker.num_workers
+
+        global_worker_id = rank * num_workers + worker_id
+        global_num_workers = world_size * num_workers
+
+        shard_paths = self.shard_paths[global_worker_id::global_num_workers]
+
+        for shard_path in shard_paths:
             tokens = np.load(shard_path)
+
             n_examples = (len(tokens) - 1) // self.block_size
+
             for i in range(n_examples):
                 start_idx = i * self.block_size
                 end_idx = start_idx + self.block_size + 1
                 seq = tokens[start_idx:end_idx]
-                
+
                 input_ids = torch.from_numpy(seq[:-1].copy()).long()
                 attention_mask = torch.ones_like(input_ids)
                 labels = torch.from_numpy(seq[1:].copy()).long()
+
                 yield {
                     "input_ids": input_ids,
                     "attention_mask": attention_mask,
-                    "labels": labels
+                    "labels": labels,
                 }
 
 
