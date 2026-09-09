@@ -1,12 +1,13 @@
+from typing import NamedTuple
+
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from typing import NamedTuple, Optional
+from torch import nn
 
 
 class MLPOutput(NamedTuple):
     value: torch.Tensor
-    loss: Optional[torch.Tensor] = None
+    loss: torch.Tensor | None = None
 
 
 class FeedForward(nn.Module):

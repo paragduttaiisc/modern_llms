@@ -1,9 +1,9 @@
+
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from transformers.cache_utils import Cache
 from rotary_embedding_torch import RotaryEmbedding
-from typing import Optional
+from torch import nn
+from transformers.cache_utils import Cache
 
 
 class MultiHeadedLatentAttention(nn.Module):
@@ -56,14 +56,14 @@ class MultiHeadedLatentAttention(nn.Module):
         if not self.flash:
             self.register_buffer(
                 'mask', torch.tril(torch.ones(block_size, block_size)))
-    
+
     def forward(
             self,
             x: torch.Tensor,
             rotary_emb: RotaryEmbedding,
-            past_key_values: Optional[Cache] = None,
-            past_length: Optional[int] = 0,
-            layer_idx: Optional[int] = None,
+            past_key_values: Cache | None = None,
+            past_length: int | None = 0,
+            layer_idx: int | None = None,
     ) -> torch.Tensor:
         B, T, _ = x.shape
 
@@ -100,12 +100,12 @@ class MultiHeadedLatentAttention(nn.Module):
         k = torch.cat(
             [k_nope, k_rope.expand(-1, self.num_heads, -1, -1)], dim=-1)
 
-        if self.flash: 
-            is_causal = (T > 1) 
+        if self.flash:
+            is_causal = (T > 1)
             out = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=None, is_causal=is_causal,
                 dropout_p=self.dropout.p if self.training else 0.0)
-        else: 
+        else:
             att = q @ k.transpose(-2, -1) * (self.head_dim ** -0.5)
             if T > 1:
                 T_k = k.shape[-2]
@@ -114,6 +114,6 @@ class MultiHeadedLatentAttention(nn.Module):
             att = F.softmax(att, dim=-1)
             att = self.dropout(att)
             out = att @ v
-            
+
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.proj(out)

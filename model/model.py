@@ -1,12 +1,12 @@
 import math
+
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from transformers import PreTrainedModel, GenerationMixin
-from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers.cache_utils import Cache
 from rotary_embedding_torch import RotaryEmbedding
-from typing import Optional
+from torch import nn
+from transformers import GenerationMixin, PreTrainedModel
+from transformers.cache_utils import Cache
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from .config import ModelConfig
 from .layer import Block
@@ -15,7 +15,7 @@ from .layer import Block
 class Model(PreTrainedModel, GenerationMixin):
     config_class = ModelConfig
     base_model_prefix = "modern_transformer"
-    _tied_weights_keys = {"lm_head.weight": "tok_emb_table.weight"}
+    _tied_weights_keys = {"lm_head.weight": "tok_emb_table.weight"}  # noqa: RUF012
 
     def __init__(
             self,
@@ -45,13 +45,13 @@ class Model(PreTrainedModel, GenerationMixin):
         self.rms_norm_f = nn.RMSNorm(config.embedding_size, eps=1e-6)
         self.lm_head = nn.Linear(config.embedding_size, config.vocab_size)
         self.block_size = config.block_size
-        
+
         self.config.tie_word_embeddings = True
         self.post_init()
 
         self.last_lm_loss = None
         self.last_router_loss = None
-    
+
     def weight_init(self, module):
         if isinstance(module, nn.Linear):
             if (
@@ -93,7 +93,7 @@ class Model(PreTrainedModel, GenerationMixin):
     def prepare_inputs_for_generation(
         self,
         input_ids: torch.Tensor,
-        past_key_values: Optional[Cache] = None,
+        past_key_values: Cache | None = None,
         **kwargs
     ):
         past_length = 0
@@ -115,11 +115,11 @@ class Model(PreTrainedModel, GenerationMixin):
     def forward(
         self,
         input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
-        num_items_in_batch: Optional[int] = None,
-        past_key_values: Optional[Cache] = None,
-        use_cache: Optional[bool] = None,
+        attention_mask: torch.Tensor | None = None,
+        labels: torch.Tensor | None = None,
+        num_items_in_batch: int | None = None,
+        past_key_values: Cache | None = None,
+        use_cache: bool | None = None,
         return_per_sample_loss: bool = False,
         **kwargs,
     ) -> CausalLMOutputWithPast:
@@ -127,7 +127,7 @@ class Model(PreTrainedModel, GenerationMixin):
 
         use_cache = use_cache if use_cache is not None\
             else getattr(self.config, "use_cache", True)
-        
+
         x = self.emb_drop(self.tok_emb_table(input_ids))
         x = x.to(next(self.parameters()).dtype)
 
@@ -164,7 +164,7 @@ class Model(PreTrainedModel, GenerationMixin):
 
             if attention_mask is not None:
                 labels[attention_mask == 0] = -100
-            
+
             lm_loss = F.cross_entropy(
                 logits.view(-1, C),
                 labels.view(-1),

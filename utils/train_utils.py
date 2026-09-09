@@ -1,15 +1,15 @@
-import os
 import math
+import os
 import time
-import torch
-from transformers import Trainer
-from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
-from torch.utils.data import DataLoader
-from typing import Optional
 
-from .optimizer_utils import MultiOptimizer, MultiScheduler
+import torch
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.utils.data import DataLoader
+from transformers import Trainer
+
 from .data_utils import HellaswagDataset, hellaswag_collate_fn
 from .misc_utils import human_readable_numbers as hrn
+from .optimizer_utils import MultiOptimizer, MultiScheduler
 
 
 class LLMTrainer(Trainer):
@@ -24,25 +24,25 @@ class LLMTrainer(Trainer):
             **kwargs
     ) -> None:
         super().__init__(*args, **kwargs)
-        
+
         self.block_size = block_size
         self.warmup_iters = warmup_iters
         self.last_decay_iter = last_decay_iter
 
         self.muon_lr = muon_lr
         self.muon_weight_decay = muon_weight_decay
-        
+
         self.total_tokens = 0
         self.log_start_time = time.time()
         self.log_start_tokens = 0
         self.log_start_steps = 0
-    
+
     def create_optimizer(self) -> torch.optim.Optimizer:
         if self.optimizer is None:
             muon_params = []
             adamw_decay_params = []
             adamw_nodecay_params = []
-            
+
             for name, p in self.model.named_parameters(): # type: ignore
                 if p.requires_grad:
                     if any(k in name for k in ["mhc", "router"]):
@@ -59,7 +59,7 @@ class LLMTrainer(Trainer):
                         else:
                             adamw_nodecay_params.append(p)
 
-            if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+            if int(os.environ.get("LOCAL_RANK", 0)) == 0:  # noqa: PLW1508
                 sum_p = lambda params: sum(p.numel() for p in params)
                 print(f"Muon (2D Hidden): {len(muon_params)} tensors,"
                       f" {hrn(sum_p(muon_params))} params")
@@ -67,7 +67,7 @@ class LLMTrainer(Trainer):
                       f" {hrn(sum_p(adamw_decay_params))} params")
                 print(f"AdamW (No Decay): {len(adamw_nodecay_params)} tensors,"
                       f" {hrn(sum_p(adamw_nodecay_params))} params")
-            
+
             opt_muon = torch.optim.Muon(
                 muon_params, lr=self.muon_lr,
                 weight_decay=self.muon_weight_decay)
@@ -78,25 +78,25 @@ class LLMTrainer(Trainer):
                 "params": adamw_nodecay_params,
                 "weight_decay": 0.0,
             }, {
-                "params": adamw_decay_params, 
+                "params": adamw_decay_params,
                 "weight_decay": self.args.weight_decay,
             }]
             opt_adamw = torch.optim.AdamW(
-                adamw_groups, 
-                lr=self.args.learning_rate, 
+                adamw_groups,
+                lr=self.args.learning_rate,
                 betas=(self.args.adam_beta1, self.args.adam_beta2),
-                eps=self.args.adam_epsilon, 
+                eps=self.args.adam_epsilon,
                 fused=use_fused
             )
-            
+
             self.optimizer = MultiOptimizer([opt_muon, opt_adamw])
-            
+
         return self.optimizer
-    
+
     def create_scheduler(
             self,
             num_training_steps: int,
-            optimizer: Optional[torch.optim.Optimizer] = None,
+            optimizer: torch.optim.Optimizer | None = None,
     ) -> torch.optim.lr_scheduler.LRScheduler:
         if self.lr_scheduler is None:
             opt_multi = optimizer if optimizer is not None else self.optimizer
@@ -105,7 +105,7 @@ class LLMTrainer(Trainer):
                     not hasattr(base_opt, "optimizers"):
                 base_opt = base_opt.optimizer # type: ignore
             opt_muon, opt_adamw = base_opt.optimizers # type: ignore
-            
+
             muon_warmup = LinearLR(
                 opt_muon, start_factor=1e-6, total_iters=self.warmup_iters)
             muon_cosine = CosineAnnealingLR(
@@ -130,19 +130,19 @@ class LLMTrainer(Trainer):
                 opt_adamw, milestones=[self.warmup_iters, self.last_decay_iter],
                 schedulers=[adamw_warmup, adamw_cosine, adamw_const])
             self.lr_scheduler = MultiScheduler([muon_seq, adamw_seq], opt_multi)
-            
+
         return self.lr_scheduler
-    
+
     def training_step(self, model, inputs, *args, **kwargs) -> torch.Tensor:
         loss = super().training_step(model, inputs, *args, **kwargs)
-        
+
         if "input_ids" in inputs:
             local_tokens = inputs["input_ids"].numel()
             world_size =\
                 self.args.world_size if hasattr(self.args, "world_size") else 1
             self.total_tokens += local_tokens * world_size
         return loss
-    
+
     @torch.no_grad()
     def evaluate_hellaswag(self) -> float:
         dataset = HellaswagDataset(
@@ -184,7 +184,7 @@ class LLMTrainer(Trainer):
         total = self.accelerator.gather(total).sum() # type: ignore
 
         return (correct.float() / total.float()).item()
-    
+
     def evaluate(
         self,
         eval_dataset=None,
@@ -205,7 +205,7 @@ class LLMTrainer(Trainer):
         self.log({"eval_hellaswag_acc": hellaswag_acc})
 
         return metrics
-    
+
     def log(self, logs: dict, *args, **kwargs) -> None:
         logs.pop("learning_rate", None)
 
@@ -239,7 +239,7 @@ class LLMTrainer(Trainer):
                 while hasattr(base_opt, "optimizer")\
                         and not hasattr(base_opt, "optimizers"):
                     base_opt = base_opt.optimizer # type: ignore
-                    
+
                 if hasattr(base_opt, "optimizers"):
                     logs["muon_lr"] =\
                         base_opt.optimizers[0].param_groups[0]["lr"]
@@ -248,8 +248,8 @@ class LLMTrainer(Trainer):
             try:
                 logs["perplexity"] = math.exp(logs["loss"])
             except OverflowError:
-                logs["perplexity"] = float("inf")            
-            
+                logs["perplexity"] = float("inf")
+
             self.log_start_time = time.time()
             self.log_start_tokens = self.total_tokens
             self.log_start_steps = self.state.global_step

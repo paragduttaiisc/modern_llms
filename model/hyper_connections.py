@@ -1,6 +1,6 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from torch import nn
+
 
 class MHCRouter(nn.Module):
     def __init__(self, embedding_size: int, n_streams: int = 4):
@@ -15,7 +15,7 @@ class MHCRouter(nn.Module):
         self.alpha_pre = nn.Parameter(torch.ones(1))
         self.alpha_post = nn.Parameter(torch.ones(1))
         self.alpha_res = nn.Parameter(torch.ones(1))
-        
+
         self.rms_norm = nn.RMSNorm(embedding_size, eps=1e-6)
 
     @staticmethod
@@ -46,10 +46,10 @@ class MHCRouter(nn.Module):
 
     def collapse(self, x: torch.Tensor) -> torch.Tensor:
         x_mean = self.rms_norm(x.mean(dim=2))
-        
+
         h_pre_raw = self.alpha_pre * self.phi_pre(x_mean)
         h_pre = torch.sigmoid(h_pre_raw) # [B, T, S]
-        
+
         h_pre = h_pre / (h_pre.sum(dim=-1, keepdim=True) + 1e-6)
-        
+
         return torch.sum(x * h_pre.unsqueeze(-1), dim=2)

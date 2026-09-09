@@ -1,8 +1,14 @@
-import time
-import torch
 import argparse
-from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig
-from transformers import pipeline, set_seed
+import time
+
+import torch
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    GenerationConfig,
+    pipeline,
+    set_seed,
+)
 
 from model import Model, ModelConfig
 from utils import get_tokenizer
@@ -24,7 +30,7 @@ def main(args: argparse.Namespace):
         repetition_penalty=1.2,
         num_beams=5,
         use_cache=args.use_cache,
-        temperature=args.temperature, 
+        temperature=args.temperature,
         do_sample=True,
     )
     generator = pipeline(
@@ -39,14 +45,14 @@ def main(args: argparse.Namespace):
     if args.device.startswith("cuda"):
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
-        
+
         start_event.record()
         with torch.no_grad():
             outputs = generator(args.prompt, generation_config=generation_config)
         end_event.record()
-        
+
         # Force CPU to wait for GPU to finish
-        torch.cuda.synchronize() 
+        torch.cuda.synchronize()
         elapsed_time_s = start_event.elapsed_time(end_event) / 1000.0
     else:
         # Fallback for CPU execution
@@ -54,7 +60,7 @@ def main(args: argparse.Namespace):
         with torch.no_grad():
             outputs = generator(args.prompt, generation_config=generation_config)
         elapsed_time_s = time.perf_counter() - start_time
-    
+
     prompt_tokens = len(tokenizer.encode(args.prompt))
     total_generated_tokens = 0
 
@@ -66,7 +72,7 @@ def main(args: argparse.Namespace):
             print(f"Sequence {i+1}:\n{output['generated_text']}\n")
             seq_tokens = len(tokenizer.encode(output['generated_text'])) - prompt_tokens
             total_generated_tokens += seq_tokens
-    
+
     print("-" * 40)
     print(f"Total Time:         {elapsed_time_s:.3f} seconds")
     print(f"Tokens Generated:   {total_generated_tokens} tokens")

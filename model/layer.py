@@ -1,12 +1,13 @@
-import torch
-import torch.nn as nn
-from transformers.cache_utils import Cache
-from rotary_embedding_torch import RotaryEmbedding
-from typing import Optional, Tuple
 
-from .hyper_connections import MHCRouter
+import torch
+from rotary_embedding_torch import RotaryEmbedding
+from torch import nn
+from transformers.cache_utils import Cache
+
 from .attention import MultiHeadedLatentAttention as Attention
-from .feed_forward import FeedForward as MLP, MoE
+from .feed_forward import FeedForward as MLP
+from .feed_forward import MoE
+from .hyper_connections import MHCRouter
 
 
 class Block(nn.Module):
@@ -67,10 +68,10 @@ class Block(nn.Module):
             self,
             x: torch.Tensor,
             rotary_emb: RotaryEmbedding,
-            past_key_values: Optional[Cache] = None,
-            past_length: Optional[int] = 0,
-            layer_idx: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+            past_key_values: Cache | None = None,
+            past_length: int | None = 0,
+            layer_idx: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         x = self.attn_mhc(x, self.sa_heads(
             self.rms_norm1(self.attn_mhc.collapse(x)),
             rotary_emb,
