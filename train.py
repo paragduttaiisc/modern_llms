@@ -90,7 +90,6 @@ def main(args: argparse.Namespace):
         output_dir=args.save_dir,
         torch_compile=True,
         use_cache=False,
-        accelerator_config={"dispatch_batches": False},
         max_steps=args.n_iters,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
@@ -108,7 +107,7 @@ def main(args: argparse.Namespace):
         run_name=args.wandb_run_name,
         project=args.wandb_project,
         max_grad_norm=args.max_grad_norm,
-        dataloader_num_workers=args.num_workers,
+        dataloader_num_workers=1,
         ddp_find_unused_parameters=args.n_experts > 1,
         report_to="wandb" if args.wandb_run_name else\
             "none" if args.dont_log else "tensorboard",
@@ -137,7 +136,6 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--shard-list-file", type=str, default="data/web_small_10B.json")
     parser.add_argument("--save-dir", type=str, default="outputs")
-    parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--vocab-size", type=int, default=49216)
     parser.add_argument("--block-size", type=int, default=2048)
     parser.add_argument("--n-layers", type=int, default=12)
@@ -162,14 +160,14 @@ if __name__ == "__main__":
     parser.add_argument("--optimizer-epsilon", type=float, default=1e-8)
     parser.add_argument("--router-loss-weight", type=float, default=0.01)
     parser.add_argument("--use-fused-optimizer", type=bool, default=True)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--effective-tokens-target", type=int, default=2**19)
-    parser.add_argument("--n-iters", type=int, default=75250)
-    parser.add_argument("--warmup-iters", type=int, default=750)
-    parser.add_argument("--last-decay-iter", type=int, default=72000)
+    parser.add_argument("--n-iters", type=int, default=38140)
+    parser.add_argument("--warmup-iters", type=int, default=350)
+    parser.add_argument("--last-decay-iter", type=int, default=37000)
     parser.add_argument("--log-interval", type=int, default=10)
-    parser.add_argument("--eval-interval", type=int, default=1000)
-    parser.add_argument("--save-interval", type=int, default=10000)
+    parser.add_argument("--eval-interval", type=int, default=500)
+    parser.add_argument("--save-interval", type=int, default=5000)
     parser.add_argument("--use-bf16", action="store_true")
     parser.add_argument("--dont-log", action="store_true")
     parser.add_argument("--dont-save", action="store_true")

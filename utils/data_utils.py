@@ -44,41 +44,16 @@ class TokenDataset(IterableDataset):
         self.shard_paths = data[subset]
 
     def __iter__(self):
-        worker = torch.utils.data.get_worker_info()
-
-        if torch.distributed.is_initialized():
-            rank = torch.distributed.get_rank()
-            world_size = torch.distributed.get_world_size()
-        else:
-            rank = 0
-            world_size = 1
-
-        if worker is None:
-            worker_id = 0
-            num_workers = 1
-        else:
-            worker_id = worker.id
-            num_workers = worker.num_workers
-
-        global_worker_id = rank * num_workers + worker_id
-        global_num_workers = world_size * num_workers
-
-        shard_paths = self.shard_paths[global_worker_id::global_num_workers]
-
-        for shard_path in shard_paths:
+        for shard_path in self.shard_paths:
             tokens = np.load(shard_path)
-
             n_examples = (len(tokens) - 1) // self.block_size
-
             for i in range(n_examples):
                 start_idx = i * self.block_size
                 end_idx = start_idx + self.block_size + 1
                 seq = tokens[start_idx:end_idx]
-
                 input_ids = torch.from_numpy(seq[:-1].copy()).long()
                 attention_mask = torch.ones_like(input_ids)
                 labels = torch.from_numpy(seq[1:].copy()).long()
-
                 yield {
                     "input_ids": input_ids,
                     "attention_mask": attention_mask,
@@ -89,16 +64,10 @@ class TokenDataset(IterableDataset):
 class HellaswagDataset(Dataset):
     def __init__(self, data_path: str):
         sentences = np.load(data_path, allow_pickle=True)
-
         assert len(sentences) % 4 == 0
-
         self.sentences = sentences.reshape(-1, 4, sentences.shape[-1])
-
         self.lengths = np.array([
-            [
-                np.where(candidate != 0)[0][-1] + 1
-                for candidate in example
-            ]
+            [ np.where(candidate != 0)[0][-1] + 1 for candidate in example ]
             for example in self.sentences
         ])
 
@@ -108,44 +77,23 @@ class HellaswagDataset(Dataset):
     def __getitem__(self, idx):
         sentences = self.sentences[idx]      # [4, seq_len]
         lengths = self.lengths[idx]          # [4]
-
-        input_ids = []
-        labels = []
-        attention_masks = []
-
+        input_ids, labels, attention_masks = [], [], []
         for sentence, length in zip(sentences, lengths):
             pad_len = len(sentence) - length
-
             input_ids.append(sentence[:-1])
             labels.append(sentence[1:])
-
             attention_masks.append(
-                np.concatenate([
-                    np.ones(length - 1),
-                    np.zeros(pad_len)
-                ])
+                np.concatenate([np.ones(length - 1), np.zeros(pad_len)])
             )
-
         return {
-            "input_ids": torch.tensor(
-                np.stack(input_ids),
-                dtype=torch.long
-            ),
-            "labels": torch.tensor(
-                np.stack(labels),
-                dtype=torch.long
-            ),
-            "attention_mask": torch.tensor(
-                np.stack(attention_masks),
-                dtype=torch.long
-            )
+            "input_ids": torch.tensor(np.stack(input_ids), dtype=torch.long),
+            "labels": torch.tensor(np.stack(labels), dtype=torch.long),
+            "attention_mask": torch.tensor(np.stack(attention_masks), dtype=torch.long)
         }
 
 
 def hellaswag_collate_fn(batch):
     batch = default_collate(batch)
-
     return {
-        k: v.flatten(0, 1)
-        for k, v in batch.items()
+        k: v.flatten(0, 1) for k, v in batch.items()
     }
