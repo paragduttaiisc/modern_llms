@@ -10,6 +10,31 @@ from .feed_forward import MoE
 from .hyper_connections import MHCRouter
 
 
+class ResidualConnection(nn.Module):
+    def __init__(self, embedding_size: int, n_streams: int):
+        super().__init__()
+
+        self.n_streams = n_streams
+
+        if n_streams == 1:
+            self.mhc = None
+        else:
+            self.mhc = MHCRouter(
+                embedding_size=embedding_size,
+                n_streams=n_streams,
+            )
+
+    def collapse(self, x):
+        if self.mhc is None:
+            return x
+        return self.mhc.collapse(x)
+
+    def expand(self, x, y):
+        if self.mhc is None:
+            return x + y
+        return self.mhc(x, y)
+
+
 class Block(nn.Module):
     def __init__(
             self,
@@ -27,6 +52,7 @@ class Block(nn.Module):
             dropout: float,
     ) -> None:
         super().__init__()
+
         self.sa_heads = Attention(
             num_heads=num_attn_heads,
             embed_dim=embedding_size,
@@ -34,8 +60,9 @@ class Block(nn.Module):
             rope_dim=rope_size,
             kv_latent_dim=kv_latent_size,
             block_size=block_size,
-            dropout=dropout
+            dropout=dropout,
         )
+
         if n_experts == 1:
             self.ffn = MLP(
                 n_embed=embedding_size,
@@ -43,6 +70,7 @@ class Block(nn.Module):
                 activation=activation,
                 dropout=dropout,
             )
+            self.is_moe = False
         else:
             self.ffn = MoE(
                 n_embed=embedding_size,
@@ -52,16 +80,18 @@ class Block(nn.Module):
                 activation=activation,
                 dropout=dropout,
             )
+            self.is_moe = True
+
         self.rms_norm1 = nn.RMSNorm(embedding_size, eps=1e-6)
         self.rms_norm2 = nn.RMSNorm(embedding_size, eps=1e-6)
 
-        self.attn_mhc = MHCRouter(
+        self.attn_residual = ResidualConnection(
             embedding_size=embedding_size,
-            n_streams=num_residual_streams
+            n_streams=num_residual_streams,
         )
-        self.ffn_mhc = MHCRouter(
+        self.ffn_residual = ResidualConnection(
             embedding_size=embedding_size,
-            n_streams=num_residual_streams
+            n_streams=num_residual_streams,
         )
 
     def forward(
@@ -72,13 +102,19 @@ class Block(nn.Module):
             past_length: int | None = 0,
             layer_idx: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        x = self.attn_mhc(x, self.sa_heads(
-            self.rms_norm1(self.attn_mhc.collapse(x)),
+        attn_input = self.attn_residual.collapse(x)
+        attn_output = self.sa_heads(
+            self.rms_norm1(attn_input),
             rotary_emb,
             past_key_values,
             past_length,
-            layer_idx
-        ))
-        router_output = self.ffn(self.rms_norm2(self.ffn_mhc.collapse(x)))
-        x = self.ffn_mhc(x, router_output.value)
-        return x, router_output.loss
+            layer_idx,
+        )
+        x = self.attn_residual.expand(x, attn_output)
+
+        ffn_input = self.ffn_residual.collapse(x)
+        ffn_output = self.ffn(self.rms_norm2(ffn_input))
+
+        x = self.ffn_residual.expand(x, ffn_output.value)
+
+        return x, ffn_output.loss if self.is_moe else None
