@@ -17,22 +17,21 @@ from utils import human_readable_numbers as hrn
 
 def main(args: argparse.Namespace):
     # Setup
-    torch.set_float32_matmul_precision('medium' if args.use_bf16 else 'high')
+    torch.set_float32_matmul_precision('medium')
     set_seed(args.seed)
     os.environ["WANDB_PROJECT"] = args.wandb_project
     os.environ["WANDB_ENTITY"] = args.wandb_entity
     effective_tokens_target = args.effective_tokens_target
     effective_batch_size = args.batch_size
     if torch.cuda.is_available():
-        world_size = int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
+        world_size =\
+            int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
         effective_batch_size *= world_size
     effective_token_size = effective_batch_size * args.block_size
     accelerator = Accelerator(
-        mixed_precision="bf16" if args.use_bf16 and torch.cuda.is_available()\
-            else "no", gradient_accumulation_steps=args.grad_accum_steps\
-                if args.grad_accum_steps != -1 else\
-                    math.ceil(effective_tokens_target / effective_token_size),
-    )
+        mixed_precision="bf16", gradient_accumulation_steps=\
+            args.grad_accum_steps if args.grad_accum_steps != -1 else\
+                math.ceil(effective_tokens_target / effective_token_size))
     if accelerator.is_main_process:
         print("Targeted Effective tokens:", hrn(args.effective_tokens_target))
         print("Num of GPUs:", world_size)
@@ -45,15 +44,9 @@ def main(args: argparse.Namespace):
     # Prepare data
     tokenizer = get_tokenizer()
     trainset = TokenDataset(
-        args.shard_list_file,
-        block_size=args.block_size,
-        subset="train"
-    )
+        args.shard_list_file, block_size=args.block_size, subset="train")
     valset = TokenDataset(
-        args.shard_list_file,
-        block_size=args.block_size,
-        subset="val"
-    )
+        args.shard_list_file, block_size=args.block_size, subset="val")
     if accelerator.is_main_process:
         print("Tokenizer vocab size:", hrn(tokenizer.vocab_size))
         print("Num tokens in trainset:", hrn(int(len(trainset.shard_paths) * 2e7)))
@@ -81,9 +74,15 @@ def main(args: argparse.Namespace):
     model.config.pad_token_id = tokenizer.pad_token_id
     model.generation_config.eos_token_id = tokenizer.eos_token_id
     model.generation_config.pad_token_id = tokenizer.pad_token_id
+
+    model.apply(model.weight_init)
+    if torch.cuda.is_available():
+        model = model.to(dtype=torch.bfloat16)
+
     if accelerator.is_main_process:
         num_params = sum(p.numel() for p in model.parameters())
         print("Number of parameters in model:", hrn(num_params))
+        print("Model parameter dtype:", next(model.parameters()).dtype)
 
     # # train
     training_args = TrainingArguments(
@@ -102,13 +101,13 @@ def main(args: argparse.Namespace):
         save_steps=-1 if args.dont_save else args.save_interval,
         learning_rate=args.adamw_lr,
         weight_decay=args.adamw_weight_decay,
-        bf16=args.use_bf16 and torch.cuda.is_available(),
+        bf16=True,
         logging_steps=args.log_interval,
         run_name=args.wandb_run_name,
         project=args.wandb_project,
         max_grad_norm=args.max_grad_norm,
         dataloader_num_workers=1,
-        ddp_find_unused_parameters=args.n_experts > 1,
+        ddp_find_unused_parameters=False,
         report_to="wandb" if args.wandb_run_name else\
             "none" if args.dont_log else "tensorboard",
     )
@@ -123,7 +122,6 @@ def main(args: argparse.Namespace):
         muon_lr=args.muon_lr,
         muon_weight_decay=args.muon_weight_decay
     )
-    model.apply(model.weight_init)
     if accelerator.is_main_process:
         print("Starting training...")
     trainer.train()
@@ -162,13 +160,12 @@ if __name__ == "__main__":
     parser.add_argument("--use-fused-optimizer", type=bool, default=True)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--effective-tokens-target", type=int, default=2**19)
-    parser.add_argument("--n-iters", type=int, default=38140)
-    parser.add_argument("--warmup-iters", type=int, default=350)
-    parser.add_argument("--last-decay-iter", type=int, default=37000)
+    parser.add_argument("--n-iters", type=int, default=19050)
+    parser.add_argument("--warmup-iters", type=int, default=200)
+    parser.add_argument("--last-decay-iter", type=int, default=17150)
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--eval-interval", type=int, default=500)
     parser.add_argument("--save-interval", type=int, default=5000)
-    parser.add_argument("--use-bf16", action="store_true")
     parser.add_argument("--dont-log", action="store_true")
     parser.add_argument("--dont-save", action="store_true")
     parser.add_argument("--dont-eval", action="store_true")
