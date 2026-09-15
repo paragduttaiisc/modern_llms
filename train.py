@@ -43,8 +43,15 @@ def main(args: argparse.Namespace):
 
     # Prepare data
     tokenizer = get_tokenizer()
+    ckpt_path, resume_iter = None, 0
+    if args.resume_training:
+        resume_iter = args.resume_iter if args.resume_iter > 0 else max([
+        int(d.split("-")[-1]) for d in os.listdir(args.save_dir)
+        if d.startswith("checkpoint-")])
+        ckpt_path = os.path.join(args.save_dir, "checkpoint-" + resume_iter)
     trainset = TokenDataset(
-        args.shard_list_file, block_size=args.block_size, subset="train")
+        args.shard_list_file, block_size=args.block_size, subset="train", resume_iter=resume_iter, batch_size=args.effective_token_size *\
+        accelerator.gradient_accumulation_steps)
     valset = TokenDataset(
         args.shard_list_file, block_size=args.block_size, subset="val")
     if accelerator.is_main_process:
@@ -90,6 +97,7 @@ def main(args: argparse.Namespace):
         torch_compile=True,
         use_cache=False,
         max_steps=args.n_iters,
+        ignore_data_skip=True, # TODO: Adapt dataloader accordingly
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
         eval_on_start=not args.dont_eval,
@@ -124,7 +132,7 @@ def main(args: argparse.Namespace):
     )
     if accelerator.is_main_process:
         print("Starting training...")
-    trainer.train()
+    trainer.train(resume_from_checkpoint=ckpt_path)
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
 
@@ -166,6 +174,8 @@ if __name__ == "__main__":
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--eval-interval", type=int, default=500)
     parser.add_argument("--save-interval", type=int, default=5000)
+    parser.add_argument("--resume-training", action="store_true")
+    parser.add_argument("--resume-iter", type=int, default=0)
     parser.add_argument("--dont-log", action="store_true")
     parser.add_argument("--dont-save", action="store_true")
     parser.add_argument("--dont-eval", action="store_true")

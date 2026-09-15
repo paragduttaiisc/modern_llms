@@ -36,12 +36,18 @@ class TokenDataset(IterableDataset):
             self,
             shard_list_file: str,
             block_size: int,
-            subset: str = "train"
+            subset: str = "train",
+            resume_iter: int = 0,
+            batch_size: int = 2**19
     ) -> None:
         self.block_size = block_size
         with open(shard_list_file, 'r') as f:
             data = json.load(f)
         self.shard_paths = data[subset]
+        if resume_iter > 0:
+            total_tokens_consumed = batch_size * resume_iter
+            num_shards_consumed = total_tokens_consumed // 2e7
+            self.shard_paths = self.shard_paths[num_shards_consumed:]
 
     def __iter__(self):
         for shard_path in self.shard_paths:
