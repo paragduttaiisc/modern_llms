@@ -45,6 +45,8 @@ utils/
   train_utils.py             ← LLMTrainer (HuggingFace Trainer subclass)
   spec_decode.py             ← Greedy + MTP self-speculative decoding
   misc_utils.py              ← human_readable_numbers helper
+scripts/
+  token_frequencies.py       ← Token counts for the MTP draft vocabulary
 tokenizer/                   ← Custom tokenizer (starcoderbase base + special tokens)
 data -> /home/parag/Data/llm_data   ← Symlink to shard data
 ```
@@ -90,7 +92,7 @@ Input Embedding
 - **Block structure**: Pre-norm RMSNorm → MLA → residual → RMSNorm → FFN → residual. The FFN is either a plain MLP (when `n_experts=1`) or a sparse MoE (when `n_experts>1`). Gated SwiGLU or standard activation.
 - **MoE** — Each FFN layer is replaced by a sparse Mixture-of-Experts with top-k gating. Switch-style load-balancing auxiliary loss (`n_experts · Σ load·importance`, equal to 1 when perfectly balanced) is averaged over layers and added to the total loss scaled by `router_loss_coef`. Experts are stored as stacked 3-D weights and run with grouped matmuls.
 - **Hyper-connections (mHC)** — Each layer has a learnable multi-stream routing mechanism (`MHCRouter`) that expands the input into `num_residual_streams` parallel streams. Each stream goes through its own MLA + FFN path, and streams are mixed via Sinkhorn-Knopp soft attention before being collapsed back. Uses learnable pre-mixing (`h_pre`), post-mixing (`h_post`), and residual mixing (`h_res`) parameters.
-- **Multi-token prediction (MTP)** — With `--n-future-tokens=n > 1`, the last block is replaced by `n` parallel single-block heads on a shared trunk (Gloeckle et al., 2024); head `i` predicts token `t+1+i` and all heads share the tied unembedding. Loss = head-0 loss + `mtp_loss_weight` × mean of the other heads. Each head runs under activation checkpointing so only one head's `[B, T, V]` logits are alive at a time. Eval loss, perplexity and HellaSwag use head 0 only.
+- **Multi-token prediction (MTP)** — With `--n-future-tokens=n > 1`, the last block is replaced by `n` parallel single-block heads on a shared trunk (Gloeckle et al., 2024); head `i` predicts token `t+1+i` and all heads share the tied unembedding. Loss = head-0 loss + `mtp_loss_weight` × mean of the other heads. Each head runs under activation checkpointing so only one head's `[B, T, V]` logits are alive at a time. Eval loss, perplexity and HellaSwag use head 0 only. To cut the cost of the extra heads, they can predict over only the most frequent tokens (`draft_vocab_size`; targets outside it are ignored) and compute their loss on a random fraction of positions (`mtp_position_frac`). Head 0 always uses the full vocabulary and every position.
 - **Self-speculative decoding** — The MTP heads draft the next `n-1` tokens; one forward pass verifies them with head 0 and keeps the longest matching prefix (greedy, output identical to plain greedy decoding).
 - **Hybrid optimizer** — A single [muonium](https://pypi.org/project/muonium/) `Muon` optimizer with per-group algorithms: Muon for hidden 2-D weights (head-wise for Q / K-up / V-up) and 3-D MoE expert weights; AdamW for embeddings, the LM head, routers, mHC parameters and 1-D params. Both share one 3-phase LR schedule (warmup → cosine decay → constant plateau at 0.1×), with separate base LRs.
 
@@ -155,6 +157,16 @@ The SLURM script (`run.sh`) is configured for 4 H200 GPUs with bf16, batch=80, a
 
 Add `--n-future-tokens=4` to train 4 parallel prediction heads (`--mtp-loss-weight` scales the extra heads; `--no-mtp-checkpoint` trades memory for speed). Per-head training losses are logged as `mtp_loss_1..n`.
 
+To make the extra heads cheaper, first count token frequencies on the training data, then restrict heads 2..n to the most frequent tokens and a random half of the positions:
+
+```bash
+python scripts/token_frequencies.py --shard-list-file=data/web_small_10B.json --out=data/token_counts_web_small_10B.npy
+accelerate launch --num_processes=8 --mixed_precision=bf16 train.py --n-experts=1 --n-future-tokens=4 --no-mtp-checkpoint \
+    --draft-vocab-size=16384 --mtp-position-frac=0.5 --wandb-run-name="<RunName>"
+```
+
+On a 1B-token sample of `web_small_10B`, the top 8,192 tokens cover 95.6% of tokens and the top 16,384 cover 99.25%.
+
 ### Plain MLP
 
 Set `--n-experts=1` to disable MoE and train with a standard feed-forward network (no router loss):
@@ -184,6 +196,9 @@ accelerate launch --num_processes=8 --mixed_precision=bf16 train.py --use-bf16 -
 | `--router-loss-weight` | 0.01 | Load balancing auxiliary loss coefficient (ignored when `n_experts=1`) |
 | `--n-future-tokens` | 1 | Multi-token prediction heads (1 = standard next-token LM) |
 | `--mtp-loss-weight` | 1.0 | Weight of the mean loss of MTP heads 2..n |
+| `--draft-vocab-size` | 0 | Heads 2..n predict only the N most frequent tokens (0 = full vocab) |
+| `--draft-vocab-file` | `data/token_counts_web_small_10B.npy` | Token counts from `scripts/token_frequencies.py` |
+| `--mtp-position-frac` | 1.0 | Fraction of positions used for the loss of heads 2..n |
 | `--n-res-streams` | 1 | Number of residual streams for mHC routing (1 = plain residual) |
 | `--effective-tokens-target` | 2^19 | Target tokens for gradient accumulation calculation |
 | `--muon-lr` | 0.02 | Muon optimizer learning rate |

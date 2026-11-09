@@ -2,6 +2,7 @@ import argparse
 import math
 import os
 
+import numpy as np
 import torch
 from accelerate import Accelerator
 from transformers import TrainingArguments, set_seed
@@ -82,7 +83,20 @@ def main(args: argparse.Namespace):
         n_future_tokens=args.n_future_tokens,
         mtp_loss_weight=args.mtp_loss_weight,
         mtp_checkpoint=not args.no_mtp_checkpoint,
+        draft_vocab_size=args.draft_vocab_size if args.n_future_tokens > 1 else 0,
+        mtp_position_frac=args.mtp_position_frac,
     ))
+    if model.config.draft_vocab_size > 0:
+        # Draft vocab of the extra MTP heads = most frequent training tokens
+        counts = np.load(args.draft_vocab_file)
+        if len(counts) != args.vocab_size:
+            raise ValueError(f"{args.draft_vocab_file} has {len(counts)} "
+                             f"counts, expected vocab size {args.vocab_size}")
+        top = np.argsort(-counts, kind="stable")[:args.draft_vocab_size]
+        model.set_draft_vocab(torch.from_numpy(top))
+        if accelerator.is_main_process:
+            print(f"Draft vocab: {hrn(args.draft_vocab_size)} tokens covering "
+                  f"{counts[top].sum() / counts.sum():.2%} of counted tokens")
     model.config.eos_token_id = tokenizer.eos_token_id
     model.config.pad_token_id = tokenizer.pad_token_id
     model.generation_config.eos_token_id = tokenizer.eos_token_id
@@ -174,6 +188,9 @@ if __name__ == "__main__":
     parser.add_argument("--n-future-tokens", type=int, default=1, help="Multi-token prediction heads (1 = standard next-token LM)")
     parser.add_argument("--mtp-loss-weight", type=float, default=1.0, help="Weight of the mean loss of MTP heads 2..n")
     parser.add_argument("--no-mtp-checkpoint", action="store_true", help="Don't checkpoint MTP heads (faster, but keeps every head's logits in memory)")
+    parser.add_argument("--draft-vocab-size", type=int, default=0, help="Extra MTP heads predict only the N most frequent tokens (0 = full vocab)")
+    parser.add_argument("--draft-vocab-file", type=str, default="data/token_counts_web_small_10B.npy", help="Token counts from scripts/token_frequencies.py")
+    parser.add_argument("--mtp-position-frac", type=float, default=1.0, help="Fraction of positions used for the extra MTP heads' loss")
     parser.add_argument("--use-fused-optimizer", type=bool, default=True)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--effective-tokens-target", type=int, default=2**19)

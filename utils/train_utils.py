@@ -249,6 +249,12 @@ class LLMTrainer(Trainer):
         hellaswag_acc = self.evaluate_hellaswag()
         self.model.train() # type: ignore
 
+        # Eval allocates differently shaped buffers (full-vocab logits of the
+        # eval batch) than training. Release them so the cached-but-unused
+        # blocks don't stay reserved on top of the training working set.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         metrics["eval_hellaswag_acc"] = hellaswag_acc
         self.log({"eval_hellaswag_acc": hellaswag_acc})
 

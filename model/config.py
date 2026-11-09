@@ -24,9 +24,17 @@ class ModelConfig(PreTrainedConfig):
             n_future_tokens: int = 1,
             mtp_loss_weight: float = 1.0,
             mtp_checkpoint: bool = True,
+            draft_vocab_size: int = 0,
+            mtp_position_frac: float = 1.0,
             **kwargs
     ) -> None:
         super().__init__(**kwargs)
+        # Cheaper extra MTP heads (heads 1..n-1; head 0 is never changed):
+        # predict over only the `draft_vocab_size` most frequent tokens
+        # (0 = full vocab), and compute their training loss on a random
+        # `mtp_position_frac` of the positions.
+        self.draft_vocab_size = draft_vocab_size
+        self.mtp_position_frac = mtp_position_frac
         # Multi-token prediction: number of parallel heads (1 = standard LM),
         # weight of the mean extra-head loss, and whether each head runs
         # under activation checkpointing (keeps one head's logits in memory).

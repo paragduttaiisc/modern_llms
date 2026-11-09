@@ -57,6 +57,17 @@ class Model(PreTrainedModel, GenerationMixin):
             self.mtp_norms = nn.ModuleList([
                 nn.RMSNorm(config.embedding_size, eps=1e-6)
                 for _ in range(self.n_future_tokens)])
+            if config.draft_vocab_size > 0:
+                if config.draft_vocab_size > config.vocab_size:
+                    raise ValueError("draft_vocab_size > vocab_size")
+                # Persistent so checkpoints carry their draft vocabulary.
+                # Placeholder until set_draft_vocab() is called (train.py).
+                self.register_buffer(
+                    "draft_vocab", torch.arange(config.draft_vocab_size))
+                self.register_buffer(
+                    "vocab_to_draft", torch.full((config.vocab_size,), -100))
+                self.vocab_to_draft[:config.draft_vocab_size] =\
+                    torch.arange(config.draft_vocab_size)
         self.lm_head = nn.Linear(config.embedding_size, config.vocab_size)
         self.block_size = config.block_size
 
@@ -66,6 +77,36 @@ class Model(PreTrainedModel, GenerationMixin):
         self.last_lm_loss = None
         self.last_router_loss = None
         self.last_mtp_losses = None
+
+    @torch.no_grad()
+    def set_draft_vocab(self, token_ids: torch.Tensor) -> None:
+        """Set the reduced vocabulary of the extra MTP heads (any order)."""
+        token_ids = torch.as_tensor(token_ids).long().unique()  # sorted
+        if token_ids.numel() != self.config.draft_vocab_size:
+            raise ValueError(
+                f"expected {self.config.draft_vocab_size} unique ids, "
+                f"got {token_ids.numel()}")
+        if token_ids.min() < 0 or token_ids.max() >= self.config.vocab_size:
+            raise ValueError("draft token id out of range")
+        token_ids = token_ids.to(self.draft_vocab.device)
+        self.draft_vocab.copy_(token_ids)
+        self.vocab_to_draft.fill_(-100)
+        self.vocab_to_draft[token_ids] = torch.arange(
+            token_ids.numel(), device=token_ids.device)
+
+    def _uses_draft_vocab(self, head_idx: int) -> bool:
+        return head_idx > 0 and self.config.draft_vocab_size > 0
+
+    def _head_logits(self, head_idx: int, h: torch.Tensor) -> torch.Tensor:
+        """Unembed one head. Extra heads with a draft vocab return logits
+        over `draft_vocab` (indices into it, not token ids)."""
+        if not self._uses_draft_vocab(head_idx):
+            return self.lm_head(h)
+        return F.linear(
+            h,
+            self.lm_head.weight[self.draft_vocab],
+            self.lm_head.bias[self.draft_vocab],
+        )
 
     @staticmethod
     def _make_block(config: ModelConfig) -> Block:
@@ -202,23 +243,34 @@ class Model(PreTrainedModel, GenerationMixin):
         head_idx: int,
         x: torch.Tensor,
         targets: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Summed CE of one head, plus its MoE aux loss (0 if dense).
+        positions: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Summed CE of one head, its MoE aux loss (0 if dense), and the
+        number of targets that counted.
 
-        Runs under activation checkpointing during MTP training, so the
-        [B, T, V] logits of only one head are alive at any time.
+        The head block always runs on every position (attention needs
+        them); only the unembedding + CE is restricted to `positions`
+        (flattened B*T indices) and, for extra heads, to the draft vocab.
+        Targets outside the draft vocab are ignored. Runs under activation
+        checkpointing when `mtp_checkpoint` is set.
         """
         h, router_loss = self._run_head(head_idx, x, None, 0)
-        logits = self.lm_head(h)
+        h = h.reshape(-1, h.shape[-1])
+        targets = targets.reshape(-1)
+        if positions is not None:
+            h, targets = h[positions], targets[positions]
+        if self._uses_draft_vocab(head_idx):
+            mapped = self.vocab_to_draft[targets.clamp_min(0)]
+            targets = torch.where(targets == -100, -100, mapped)
         ce = F.cross_entropy(
-            logits.view(-1, logits.shape[-1]),
-            targets.reshape(-1),
+            self._head_logits(head_idx, h),
+            targets,
             ignore_index=-100,
             reduction="sum",
         )
         if router_loss is None:
             router_loss = torch.zeros((), device=ce.device, dtype=ce.dtype)
-        return ce, router_loss
+        return ce, router_loss, (targets != -100).sum()
 
     def _mtp_training_loss(
         self,
@@ -227,22 +279,32 @@ class Model(PreTrainedModel, GenerationMixin):
         aux_losses: list[torch.Tensor],
         num_items_in_batch: int | None,
     ) -> torch.Tensor:
-        B = labels.shape[0]
+        B, T = labels.shape
         n_valid_0 = (labels != -100).sum().clamp_min(1)
+        frac = self.config.mtp_position_frac
+        n_sampled = max(1, round(frac * B * T))
         head_losses, logged_losses = [], []
         for i in range(self.n_future_tokens):
             # labels[:, t] is token t+1; head i predicts token t+1+i.
             targets = labels if i == 0 else torch.cat(
                 [labels[:, i:], labels.new_full((B, i), -100)], dim=1)
+            # Extra heads: fixed-size random subset of positions (fixed size
+            # keeps shapes static for torch.compile). Drawn outside the
+            # checkpointed function so the recompute sees the same subset.
+            positions = torch.randperm(B * T, device=labels.device)[:n_sampled]\
+                if i > 0 and frac < 1.0 else None
             if self.config.mtp_checkpoint:
-                ce, router_loss = checkpoint(
-                    self._head_loss, i, x, targets, use_reentrant=False)
+                ce, router_loss, n_valid = checkpoint(
+                    self._head_loss, i, x, targets, positions,
+                    use_reentrant=False)
             else:
-                ce, router_loss = self._head_loss(i, x, targets)
-            # Head i has i fewer targets per sequence; scale the trainer's
-            # token count (num_items_in_batch, over all accumulation steps)
-            # accordingly so every head is a true per-token mean.
-            n_valid = (targets != -100).sum().clamp_min(1)
+                ce, router_loss, n_valid = self._head_loss(
+                    i, x, targets, positions)
+            # Extra heads see fewer targets (shifted ends, sampled positions,
+            # out-of-draft-vocab targets); scale the trainer's token count
+            # (num_items_in_batch, over all accumulation steps) accordingly
+            # so every head is a per-counted-target mean.
+            n_valid = n_valid.clamp_min(1)
             denom = n_valid if num_items_in_batch is None\
                 else num_items_in_batch * n_valid / n_valid_0
             head_losses.append(ce / denom)
@@ -356,10 +418,12 @@ class Model(PreTrainedModel, GenerationMixin):
         self,
         input_ids: torch.Tensor,
         past_key_values: Cache | None = None,
-    ) -> torch.Tensor:
-        """Logits of every head, shape [n_future_tokens, B, T, V].
+    ) -> list[torch.Tensor]:
+        """Logits of every head, each [B, T, V_i].
 
-        `logits[i, :, t]` predicts token t+1+i. Every head writes its own
+        `logits[i][:, t]` predicts token t+1+i. Head 0 is over the full
+        vocab; extra heads are over `draft_vocab` when one is set (see
+        `predict_all_heads` for token ids). Every head writes its own
         KV-cache layer, so all heads must be run on every position for the
         cache to stay consistent (used by speculative decoding).
         """
@@ -367,7 +431,23 @@ class Model(PreTrainedModel, GenerationMixin):
         past_length = past_key_values.get_seq_length()\
             if past_key_values is not None else 0
         x, _ = self._run_trunk(x, past_key_values, past_length)
-        return torch.stack([
-            self.lm_head(self._run_head(i, x, past_key_values, past_length)[0])
+        return [
+            self._head_logits(
+                i, self._run_head(i, x, past_key_values, past_length)[0])
             for i in range(self.n_future_tokens)
-        ])
+        ]
+
+    @torch.no_grad()
+    def predict_all_heads(
+        self,
+        input_ids: torch.Tensor,
+        past_key_values: Cache | None = None,
+    ) -> torch.Tensor:
+        """Greedy token ids of every head, shape [n_future_tokens, B, T]."""
+        preds = []
+        for i, logits in enumerate(
+                self.forward_all_heads(input_ids, past_key_values)):
+            ids = logits.argmax(-1)
+            preds.append(self.draft_vocab[ids]
+                         if self._uses_draft_vocab(i) else ids)
+        return torch.stack(preds)
