@@ -23,6 +23,7 @@ class LLMTrainer(Trainer):
             muon_lr: float = 0.02,
             muon_weight_decay: float = 0.01,
             matryoshka_full_prob: float = 0.5,
+            matryoshka_full_per_step: bool = False,
             **kwargs
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -35,6 +36,12 @@ class LLMTrainer(Trainer):
             self.model.config, "matryoshka_fracs", [1.0]))
         self.matryoshka_full_prob = matryoshka_full_prob
         self._matryoshka_rng = random.Random(self.args.seed)
+        # Every optimizer step contains a full-size micro-batch (the first);
+        # the rest are sampled so the overall full share stays at full_prob.
+        # Without it, with 2 micro-batches per step a quarter of the steps
+        # have no full-size gradient, and training diverges at muon_lr 0.02.
+        self.matryoshka_full_per_step = matryoshka_full_per_step
+        self._micro_batch_idx = 0
         # Per-size sums of per-token losses since the last log (see log())
         self._loss_window: dict[float, dict] = {}
 
@@ -196,8 +203,17 @@ class LLMTrainer(Trainer):
 
     def _sample_matryoshka_frac(self) -> float:
         smaller = self.matryoshka_fracs[1:]  # sorted descending, [0] == 1.0
-        if not smaller or\
-                self._matryoshka_rng.random() < self.matryoshka_full_prob:
+        if not smaller:
+            return 1.0
+        full_prob = self.matryoshka_full_prob
+        if self.matryoshka_full_per_step:
+            k = self.args.gradient_accumulation_steps
+            idx = self._micro_batch_idx % k
+            self._micro_batch_idx += 1
+            if idx == 0:
+                return 1.0
+            full_prob = max(0.0, (full_prob * k - 1) / (k - 1))
+        if self._matryoshka_rng.random() < full_prob:
             return 1.0
         return self._matryoshka_rng.choice(smaller)
 

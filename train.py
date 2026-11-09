@@ -27,6 +27,10 @@ def main(args: argparse.Namespace):
         for name in ("recompile_limit", "cache_size_limit"):
             if hasattr(torch._dynamo.config, name):
                 setattr(torch._dynamo.config, name, 64)
+        # Keep the width a Python constant in each graph. Otherwise dynamo
+        # turns it into a symbolic float after a recompile, which crashes
+        # inside the checkpointed MTP heads.
+        torch._dynamo.config.specialize_float = True
     os.environ["WANDB_PROJECT"] = args.wandb_project
     os.environ["WANDB_ENTITY"] = args.wandb_entity
     effective_tokens_target = args.effective_tokens_target
@@ -158,6 +162,7 @@ def main(args: argparse.Namespace):
         muon_lr=args.muon_lr,
         muon_weight_decay=args.muon_weight_decay,
         matryoshka_full_prob=args.matryoshka_full_prob,
+        matryoshka_full_per_step=args.matryoshka_full_per_step,
     )
     if accelerator.is_main_process:
         print("Starting training...")
@@ -202,6 +207,7 @@ if __name__ == "__main__":
     parser.add_argument("--mtp-position-frac", type=float, default=1.0, help="Fraction of positions used for the extra MTP heads' loss")
     parser.add_argument("--matryoshka-fracs", type=str, default="1", help="Comma-separated nested widths trained jointly, e.g. 1,0.5,0.25 (1 = no nesting)")
     parser.add_argument("--matryoshka-full-prob", type=float, default=0.5, help="Probability a micro-batch trains the full model (else a smaller size, uniformly)")
+    parser.add_argument("--matryoshka-full-per-step", action="store_true", help="Make the first micro-batch of every optimizer step full size (recommended: prevents divergence)")
     parser.add_argument("--use-fused-optimizer", type=bool, default=True)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--effective-tokens-target", type=int, default=2**19)
