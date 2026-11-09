@@ -65,11 +65,13 @@ class LLMTrainer(Trainer):
             is_router = "router" in name.lower()
             is_mhc = "mhc" in name.lower()
             is_embedding = "emb" in name.lower()
-            is_head = "head" in name.lower()
-            is_moe = "gate_up_weight" in name.lower()\
-                or "down_weight" in name.lower()
+            # Match only the LM head; a bare "head" also matches the
+            # attention module name "sa_heads".
+            is_head = "lm_head" in name.lower()
 
-            if is_moe and p.ndim >= 3:
+            # Stacked MoE expert weights [E, out, in]: gate_up_weight,
+            # up_weight (GELU/SqReLU), down_weight
+            if p.ndim == 3:
                 muon_3d_params.append(p)
                 continue
             if p.ndim == 2 and name.lower().endswith("q_proj.weight"):

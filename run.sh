@@ -29,7 +29,7 @@ accelerate launch \
     train.py \
     --batch-size=80 \
     --last-decay-iter=13725 \
-    --n-iters=15250
+    --n-iters=15250 \
     --save-dir="outputs" \
     --wandb-run-name="GPT2-MLA" \
     --use-bf16

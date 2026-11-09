@@ -51,7 +51,6 @@ class MoE(nn.Module):
         top_k: int = 2,
         activation: str = "SwiGLU",
         dropout: float = 0.0,
-        aux_loss_coef: float = 1e-2,
     ) -> None:
         super().__init__()
 
@@ -71,7 +70,6 @@ class MoE(nn.Module):
         self.num_experts = n_experts
         self.top_k = top_k
         self.activation = activation
-        self.aux_loss_coef = aux_loss_coef
         self.dropout_p = dropout
 
         self.router = nn.Linear(n_embed, n_experts, bias=False)
@@ -167,8 +165,9 @@ class MoE(nn.Module):
             flat_expert_indices, minlength=self.num_experts)
         load = num_tokens_per_expert.float() / float(N * self.top_k)
 
-        aux_loss = self.aux_loss_coef * self.num_experts\
-            * torch.sum(load * importance)
+        # Unscaled Switch-style balance loss (== 1.0 when perfectly balanced);
+        # Model.forward applies config.router_loss_coef.
+        aux_loss = self.num_experts * torch.sum(load * importance)
 
         self.last_load = load.detach()
         self.last_importance = importance.detach()

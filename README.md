@@ -43,7 +43,6 @@ model/
 utils/
   data_utils.py              ← TokenDataset (IterableDataset), HellaswagDataset
   train_utils.py             ← LLMTrainer (HuggingFace Trainer subclass)
-  optimizer_utils.py         ← MultiOptimizer, MultiScheduler wrappers
   misc_utils.py              ← human_readable_numbers helper
 tokenizer/                   ← Custom tokenizer (starcoderbase base + special tokens)
 data -> /home/parag/Data/llm_data   ← Symlink to shard data
@@ -88,9 +87,9 @@ Input Embedding
 
 - **MLA Attention** — K and V projections share a latent bottleneck (`kv_latent_dim`). K is split into nope (up-projected via `k_up`) and rope components; V is up-projected via `v_up`. Q is split into nope + rope. RoPE is applied only to the rope components. This is the core memory-saving innovation.
 - **Block structure**: Pre-norm RMSNorm → MLA → residual → RMSNorm → FFN → residual. The FFN is either a plain MLP (when `n_experts=1`) or a sparse MoE (when `n_experts>1`). Gated SwiGLU or standard activation.
-- **MoE** — Each FFN layer is replaced by a sparse Mixture-of-Experts with top-k gating. Load balancing auxiliary loss (MSE between expert load/importance and uniform) is tracked and added to the total loss via `router_loss_coef`.
+- **MoE** — Each FFN layer is replaced by a sparse Mixture-of-Experts with top-k gating. Switch-style load-balancing auxiliary loss (`n_experts · Σ load·importance`, equal to 1 when perfectly balanced) is averaged over layers and added to the total loss scaled by `router_loss_coef`. Experts are stored as stacked 3-D weights and run with grouped matmuls.
 - **Hyper-connections (mHC)** — Each layer has a learnable multi-stream routing mechanism (`MHCRouter`) that expands the input into `num_residual_streams` parallel streams. Each stream goes through its own MLA + FFN path, and streams are mixed via Sinkhorn-Knopp soft attention before being collapsed back. Uses learnable pre-mixing (`h_pre`), post-mixing (`h_post`), and residual mixing (`h_res`) parameters.
-- **Dual optimizer** — Muon optimizer for 2D+ parameters (weights), AdamW for 1D params (biases, embeddings). Separate LR schedules: Muon gets warmup → cosine decay → constant plateau; AdamW gets the same 3-phase schedule.
+- **Hybrid optimizer** — A single [muonium](https://pypi.org/project/muonium/) `Muon` optimizer with per-group algorithms: Muon for hidden 2-D weights (head-wise for Q / K-up / V-up) and 3-D MoE expert weights; AdamW for embeddings, the LM head, routers, mHC parameters and 1-D params. Both share one 3-phase LR schedule (warmup → cosine decay → constant plateau at 0.1×), with separate base LRs.
 
 </details>
 
@@ -172,11 +171,11 @@ accelerate launch --num_processes=8 --mixed_precision=bf16 train.py --use-bf16 -
 | `--rope-size` | 16 | RoPE dimension (subset of head_size) |
 | `--embed-size` | 768 | Model hidden dimension |
 | `--mlp-hidden-size` | 3072 | FFN hidden dimension |
-| `--non-linearity` | SqReLU | FFN activation (GELU / SwiGLU / SqReLU) |
+| `--non-linearity` | SwiGLU | FFN activation (GELU / SwiGLU / SqReLU) |
 | `--n-experts` | 8 | Number of MoE experts per layer (**1 = plain MLP**) |
 | `--n-active-experts` | 2 | Top-k experts active per token |
 | `--router-loss-weight` | 0.01 | Load balancing auxiliary loss coefficient (ignored when `n_experts=1`) |
-| `--n-res-streams` | 4 | Number of residual streams for mHC routing |
+| `--n-res-streams` | 1 | Number of residual streams for mHC routing (1 = plain residual) |
 | `--effective-tokens-target` | 2^19 | Target tokens for gradient accumulation calculation |
 | `--muon-lr` | 0.02 | Muon optimizer learning rate |
 | `--adamw-lr` | 1e-3 | AdamW optimizer learning rate |

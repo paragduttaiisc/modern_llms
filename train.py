@@ -23,6 +23,7 @@ def main(args: argparse.Namespace):
     os.environ["WANDB_ENTITY"] = args.wandb_entity
     effective_tokens_target = args.effective_tokens_target
     effective_batch_size = args.batch_size
+    world_size = 1
     if torch.cuda.is_available():
         world_size =\
             int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
@@ -48,9 +49,11 @@ def main(args: argparse.Namespace):
         resume_iter = args.resume_iter if args.resume_iter > 0 else max([
         int(d.split("-")[-1]) for d in os.listdir(args.save_dir)
         if d.startswith("checkpoint-")])
-        ckpt_path = os.path.join(args.save_dir, "checkpoint-" + resume_iter)
+        ckpt_path = os.path.join(args.save_dir, f"checkpoint-{resume_iter}")
+    # Tokens consumed per optimizer step, used to skip already-seen shards
     trainset = TokenDataset(
-        args.shard_list_file, block_size=args.block_size, subset="train", resume_iter=resume_iter, batch_size=args.effective_token_size *\
+        args.shard_list_file, block_size=args.block_size, subset="train",
+        resume_iter=resume_iter, batch_size=effective_token_size *
         accelerator.gradient_accumulation_steps)
     valset = TokenDataset(
         args.shard_list_file, block_size=args.block_size, subset="val")

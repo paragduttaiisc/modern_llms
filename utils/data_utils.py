@@ -46,7 +46,7 @@ class TokenDataset(IterableDataset):
         self.shard_paths = data[subset]
         if resume_iter > 0:
             total_tokens_consumed = batch_size * resume_iter
-            num_shards_consumed = total_tokens_consumed // 2e7
+            num_shards_consumed = int(total_tokens_consumed // 2e7)
             self.shard_paths = self.shard_paths[num_shards_consumed:]
 
     def __iter__(self):
