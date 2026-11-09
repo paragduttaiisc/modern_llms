@@ -79,6 +79,9 @@ def main(args: argparse.Namespace):
         router_loss_coef=args.router_loss_weight,
         non_linearity=args.non_linearity,
         dropout=args.dropout,
+        n_future_tokens=args.n_future_tokens,
+        mtp_loss_weight=args.mtp_loss_weight,
+        mtp_checkpoint=not args.no_mtp_checkpoint,
     ))
     model.config.eos_token_id = tokenizer.eos_token_id
     model.config.pad_token_id = tokenizer.pad_token_id
@@ -168,6 +171,9 @@ if __name__ == "__main__":
     parser.add_argument("--betas", type=float, nargs=2, default=(0.9, 0.95))
     parser.add_argument("--optimizer-epsilon", type=float, default=1e-8)
     parser.add_argument("--router-loss-weight", type=float, default=0.01)
+    parser.add_argument("--n-future-tokens", type=int, default=1, help="Multi-token prediction heads (1 = standard next-token LM)")
+    parser.add_argument("--mtp-loss-weight", type=float, default=1.0, help="Weight of the mean loss of MTP heads 2..n")
+    parser.add_argument("--no-mtp-checkpoint", action="store_true", help="Don't checkpoint MTP heads (faster, but keeps every head's logits in memory)")
     parser.add_argument("--use-fused-optimizer", type=bool, default=True)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--effective-tokens-target", type=int, default=2**19)

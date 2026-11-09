@@ -43,6 +43,7 @@ model/
 utils/
   data_utils.py              ← TokenDataset (IterableDataset), HellaswagDataset
   train_utils.py             ← LLMTrainer (HuggingFace Trainer subclass)
+  spec_decode.py             ← Greedy + MTP self-speculative decoding
   misc_utils.py              ← human_readable_numbers helper
 tokenizer/                   ← Custom tokenizer (starcoderbase base + special tokens)
 data -> /home/parag/Data/llm_data   ← Symlink to shard data
@@ -89,6 +90,8 @@ Input Embedding
 - **Block structure**: Pre-norm RMSNorm → MLA → residual → RMSNorm → FFN → residual. The FFN is either a plain MLP (when `n_experts=1`) or a sparse MoE (when `n_experts>1`). Gated SwiGLU or standard activation.
 - **MoE** — Each FFN layer is replaced by a sparse Mixture-of-Experts with top-k gating. Switch-style load-balancing auxiliary loss (`n_experts · Σ load·importance`, equal to 1 when perfectly balanced) is averaged over layers and added to the total loss scaled by `router_loss_coef`. Experts are stored as stacked 3-D weights and run with grouped matmuls.
 - **Hyper-connections (mHC)** — Each layer has a learnable multi-stream routing mechanism (`MHCRouter`) that expands the input into `num_residual_streams` parallel streams. Each stream goes through its own MLA + FFN path, and streams are mixed via Sinkhorn-Knopp soft attention before being collapsed back. Uses learnable pre-mixing (`h_pre`), post-mixing (`h_post`), and residual mixing (`h_res`) parameters.
+- **Multi-token prediction (MTP)** — With `--n-future-tokens=n > 1`, the last block is replaced by `n` parallel single-block heads on a shared trunk (Gloeckle et al., 2024); head `i` predicts token `t+1+i` and all heads share the tied unembedding. Loss = head-0 loss + `mtp_loss_weight` × mean of the other heads. Each head runs under activation checkpointing so only one head's `[B, T, V]` logits are alive at a time. Eval loss, perplexity and HellaSwag use head 0 only.
+- **Self-speculative decoding** — The MTP heads draft the next `n-1` tokens; one forward pass verifies them with head 0 and keeps the longest matching prefix (greedy, output identical to plain greedy decoding).
 - **Hybrid optimizer** — A single [muonium](https://pypi.org/project/muonium/) `Muon` optimizer with per-group algorithms: Muon for hidden 2-D weights (head-wise for Q / K-up / V-up) and 3-D MoE expert weights; AdamW for embeddings, the LM head, routers, mHC parameters and 1-D params. Both share one 3-phase LR schedule (warmup → cosine decay → constant plateau at 0.1×), with separate base LRs.
 
 </details>
@@ -148,6 +151,10 @@ sbatch run.sh
 
 The SLURM script (`run.sh`) is configured for 4 H200 GPUs with bf16, batch=80, and ~15K iterations (approx 10B tokens) targeting ~500K effective tokens per iteration.
 
+### Multi-token prediction
+
+Add `--n-future-tokens=4` to train 4 parallel prediction heads (`--mtp-loss-weight` scales the extra heads; `--no-mtp-checkpoint` trades memory for speed). Per-head training losses are logged as `mtp_loss_1..n`.
+
 ### Plain MLP
 
 Set `--n-experts=1` to disable MoE and train with a standard feed-forward network (no router loss):
@@ -175,6 +182,8 @@ accelerate launch --num_processes=8 --mixed_precision=bf16 train.py --use-bf16 -
 | `--n-experts` | 8 | Number of MoE experts per layer (**1 = plain MLP**) |
 | `--n-active-experts` | 2 | Top-k experts active per token |
 | `--router-loss-weight` | 0.01 | Load balancing auxiliary loss coefficient (ignored when `n_experts=1`) |
+| `--n-future-tokens` | 1 | Multi-token prediction heads (1 = standard next-token LM) |
+| `--mtp-loss-weight` | 1.0 | Weight of the mean loss of MTP heads 2..n |
 | `--n-res-streams` | 1 | Number of residual streams for mHC routing (1 = plain residual) |
 | `--effective-tokens-target` | 2^19 | Target tokens for gradient accumulation calculation |
 | `--muon-lr` | 0.02 | Muon optimizer learning rate |
@@ -190,6 +199,12 @@ python infer.py --save-dir=models/checkpoint-xxx --prompt "Hello" --use-cache \
 ```
 
 Add `--use-cache` to enable KV caching (speeds up autoregressive generation). Throughput is benchmarked automatically.
+
+For an MTP checkpoint, compare greedy decoding with self-speculative decoding (reports tokens per forward pass, draft acceptance and speedup):
+
+```bash
+python infer.py --save-dir=models/checkpoint-xxx --prompt "Hello" --speculative --max-new-tokens=256
+```
 
 ---
 
@@ -225,6 +240,7 @@ Logs are sent to WandB (online/offline) or TensorBoard, tracking loss, perplexit
 - [x] Mixture of Experts (MoE) — sparse top-k routing with load balancing auxiliary loss
 - [x] MLP/MoE toggle — `--n-experts=1` for plain MLP, `n_experts > 1` for MoE
 - [x] Hyper-connections (mHC) — learnable multi-stream routing with Sinkhorn-Knopp attention
+- [x] Multi-token prediction (parallel heads) with self-speculative decoding
 
 ### Planned 🚧
 

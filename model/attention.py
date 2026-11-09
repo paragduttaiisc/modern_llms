@@ -101,9 +101,17 @@ class MultiHeadedLatentAttention(nn.Module):
             [k_nope, k_rope.expand(-1, self.num_heads, -1, -1)], dim=-1)
 
         if self.flash:
-            is_causal = (T > 1)
+            # SDPA's is_causal aligns the mask top-left, which is only right
+            # when T == T_k. With a cache and T > 1 (e.g. verifying several
+            # draft tokens) the mask must be aligned bottom-right instead.
+            attn_mask, is_causal = None, (T > 1)
+            if T > 1 and T_k > T:
+                attn_mask = torch.ones(
+                    T, T_k, dtype=torch.bool, device=q.device,
+                ).tril(diagonal=T_k - T)
+                is_causal = False
             out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=None, is_causal=is_causal,
+                q, k, v, attn_mask=attn_mask, is_causal=is_causal,
                 dropout_p=self.dropout.p if self.training else 0.0)
         else:
             att = q @ k.transpose(-2, -1) * (self.head_dim ** -0.5)

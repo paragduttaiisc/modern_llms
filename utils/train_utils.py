@@ -274,6 +274,11 @@ class LLMTrainer(Trainer):
                         logs["lm_loss"] = self.model.last_lm_loss.item() # type: ignore
                     if hasattr(self.model, "last_router_loss") and self.model.last_router_loss: # type: ignore
                         logs["router_loss"] = self.model.last_router_loss.item() # type: ignore
+                    mtp_losses = getattr(self.model, "last_mtp_losses", None)
+                    if mtp_losses is not None:
+                        # head i predicts token t+1+i; head 0 == lm_loss
+                        for i, head_loss in enumerate(mtp_losses.tolist()):
+                            logs[f"mtp_loss_{i + 1}"] = head_loss
                     if getattr(self.model.config, "experts", 1) > 1: # type: ignore
                         avg_load = torch.stack([layer.ffn.last_load.float() for layer in self.model.layers]).mean(0) # type: ignore
                         avg_tokens = torch.stack([layer.ffn.last_num_tokens.float() for layer in self.model.layers]).mean(0) # type: ignore
@@ -304,8 +309,13 @@ class LLMTrainer(Trainer):
                     adamw_lr = next(iter(adamw_lrs))
                     logs["adamw_lr"] = adamw_lr.item() if type(adamw_lr) == torch.Tensor else adamw_lr
 
+            # With MTP, "loss" includes the extra heads, so next-token
+            # perplexity uses lm_loss (last micro-batch, hence noisier).
+            ppl_loss = logs["lm_loss"]\
+                if getattr(self.model.config, "n_future_tokens", 1) > 1\
+                and "lm_loss" in logs else logs["loss"]
             try:
-                logs["perplexity"] = math.exp(logs["loss"])
+                logs["perplexity"] = math.exp(ppl_loss)
             except OverflowError:
                 logs["perplexity"] = float("inf")
 

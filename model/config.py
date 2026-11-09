@@ -21,9 +21,18 @@ class ModelConfig(PreTrainedConfig):
             num_residual_streams: int = 4,
             non_linearity: str = "GELU",
             dropout: float = 0.2,
+            n_future_tokens: int = 1,
+            mtp_loss_weight: float = 1.0,
+            mtp_checkpoint: bool = True,
             **kwargs
     ) -> None:
         super().__init__(**kwargs)
+        # Multi-token prediction: number of parallel heads (1 = standard LM),
+        # weight of the mean extra-head loss, and whether each head runs
+        # under activation checkpointing (keeps one head's logits in memory).
+        self.n_future_tokens = n_future_tokens
+        self.mtp_loss_weight = mtp_loss_weight
+        self.mtp_checkpoint = mtp_checkpoint
         self.vocab_size = vocab_size
         self.block_size = block_size
         self.dropout = dropout

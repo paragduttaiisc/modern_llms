@@ -12,6 +12,52 @@ from transformers import (
 
 from model import Model, ModelConfig
 from utils import get_tokenizer
+from utils.spec_decode import greedy_decode, speculative_decode
+
+
+def _timed(fn, device: str):
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    result = fn()
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+    return result, time.perf_counter() - start
+
+
+def run_speculative(model, tokenizer, args: argparse.Namespace) -> None:
+    """Compare greedy decoding against MTP self-speculative decoding."""
+    input_ids = torch.tensor(
+        [tokenizer.encode(args.prompt)], device=args.device)
+    eos = None if args.ignore_eos else tokenizer.eos_token_id
+    run_greedy = lambda: greedy_decode(  # noqa: E731
+        model, input_ids, args.max_new_tokens, eos)
+    run_spec = lambda: speculative_decode(  # noqa: E731
+        model, input_ids, args.max_new_tokens, eos)
+    run_greedy(); run_spec()  # warm-up
+
+    greedy, t_greedy = _timed(run_greedy, args.device)
+    spec, t_spec = _timed(run_spec, args.device)
+
+    print(tokenizer.decode(input_ids[0].tolist() + spec.tokens))
+    print("-" * 40)
+    n_match = next((i for i, (a, b) in enumerate(
+        zip(greedy.tokens, spec.tokens)) if a != b),
+        min(len(greedy.tokens), len(spec.tokens)))
+    print(f"Matches greedy:     {greedy.tokens == spec.tokens} "
+          f"(first {n_match} tokens identical)")
+    print(f"Greedy:             {len(greedy.tokens)} tokens, "
+          f"{greedy.n_forwards} forwards, {t_greedy:.3f} s, "
+          f"{len(greedy.tokens) / t_greedy:.1f} tok/s")
+    print(f"Speculative:        {len(spec.tokens)} tokens, "
+          f"{spec.n_forwards} forwards, {t_spec:.3f} s, "
+          f"{len(spec.tokens) / t_spec:.1f} tok/s")
+    print(f"Tokens per forward: {spec.tokens_per_forward:.2f} "
+          f"(max {model.n_future_tokens})")
+    print(f"Speedup:            {t_greedy / t_spec:.2f}x")
+    total = max(sum(spec.accepted_hist), 1)
+    print("Accepted drafts per verify pass: " + ", ".join(
+        f"{a}: {c / total:.0%}" for a, c in enumerate(spec.accepted_hist)))
 
 
 def main(args: argparse.Namespace):
@@ -21,6 +67,9 @@ def main(args: argparse.Namespace):
     model = Model.from_pretrained(args.save_dir).to(args.device)
     model.eval()
     tokenizer = get_tokenizer()
+    if args.speculative:
+        run_speculative(model, tokenizer, args)
+        return
     generation_config = GenerationConfig(
         max_new_tokens=args.max_new_tokens,
         num_return_sequences=args.num_return_sequences,
@@ -89,6 +138,8 @@ if __name__ == "__main__":
     parser.add_argument("--use-cache", action="store_true")
     parser.add_argument("--temperature", type=float, default=0.9)
     parser.add_argument("--num-return-sequences", type=int, default=3)
+    parser.add_argument("--speculative", action="store_true", help="Benchmark greedy vs. MTP self-speculative decoding (needs an MTP checkpoint)")
+    parser.add_argument("--ignore-eos", action="store_true", help="Keep generating past EOS (for fixed-length benchmarks)")
     args = parser.parse_args()
     set_seed(args.seed)
     main(args)
