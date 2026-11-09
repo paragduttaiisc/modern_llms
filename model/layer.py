@@ -1,5 +1,6 @@
 
 import torch
+import torch.nn.functional as F
 from rotary_embedding_torch import RotaryEmbedding
 from torch import nn
 from transformers.cache_utils import Cache
@@ -8,6 +9,15 @@ from .attention import MultiHeadedLatentAttention as Attention
 from .feed_forward import FeedForward as MLP
 from .feed_forward import MoE
 from .hyper_connections import MHCRouter
+
+
+def prefix_rms_norm(norm: nn.RMSNorm, x: torch.Tensor) -> torch.Tensor:
+    """RMSNorm over the first d' = x.shape[-1] dims (Matryoshka sub-width):
+    statistics over those dims only, scaled by the first d' gains."""
+    d = x.shape[-1]
+    if d == norm.weight.shape[0]:
+        return norm(x)
+    return F.rms_norm(x, (d,), norm.weight[:d], norm.eps)
 
 
 class ResidualConnection(nn.Module):
@@ -50,6 +60,7 @@ class Block(nn.Module):
             block_size: int,
             activation: str,
             dropout: float,
+            exact_ffn_hidden: bool = False,
     ) -> None:
         super().__init__()
 
@@ -69,6 +80,7 @@ class Block(nn.Module):
                 hidden_size=ff_hidden_size,
                 activation=activation,
                 dropout=dropout,
+                exact_hidden=exact_ffn_hidden,
             )
             self.is_moe = False
         else:
@@ -79,6 +91,7 @@ class Block(nn.Module):
                 top_k=n_active_experts,
                 activation=activation,
                 dropout=dropout,
+                exact_hidden=exact_ffn_hidden,
             )
             self.is_moe = True
 
@@ -101,19 +114,25 @@ class Block(nn.Module):
             past_key_values: Cache | None = None,
             past_length: int | None = 0,
             layer_idx: int | None = None,
+            frac: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """`frac` < 1: Matryoshka sub-block on the first d' = x.shape[-1]
+        residual dims (heads / latent / FFN width scaled by `frac`)."""
+        if frac < 1.0 and self.attn_residual.mhc is not None:
+            raise NotImplementedError("Matryoshka nesting with mHC streams")
         attn_input = self.attn_residual.collapse(x)
         attn_output = self.sa_heads(
-            self.rms_norm1(attn_input),
+            prefix_rms_norm(self.rms_norm1, attn_input),
             rotary_emb,
             past_key_values,
             past_length,
             layer_idx,
+            frac,
         )
         x = self.attn_residual.expand(x, attn_output)
 
         ffn_input = self.ffn_residual.collapse(x)
-        ffn_output = self.ffn(self.rms_norm2(ffn_input))
+        ffn_output = self.ffn(prefix_rms_norm(self.rms_norm2, ffn_input), frac)
 
         x = self.ffn_residual.expand(x, ffn_output.value)
 

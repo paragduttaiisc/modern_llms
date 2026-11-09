@@ -64,20 +64,33 @@ class MultiHeadedLatentAttention(nn.Module):
             past_key_values: Cache | None = None,
             past_length: int | None = 0,
             layer_idx: int | None = None,
+            frac: float = 1.0,
     ) -> torch.Tensor:
-        B, T, _ = x.shape
+        """`frac` < 1 runs the Matryoshka sub-attention: the input is the
+        first d' = x.shape[-1] dims, and only the first `frac` of the heads
+        and of the KV latent are used. All weights are prefix slices of the
+        full ones (rows are head-major), so every matmul stays a plain GEMM.
+        Head dim and RoPE dim are never nested."""
+        B, T, d = x.shape
+        n_heads = round(self.num_heads * frac)
+        latent = round(self.kv_latent_dim * frac)
 
+        q = F.linear(x, self.q_proj.weight[:n_heads * self.head_dim, :d])
         q_nope, q_rope = torch.split(
-            self.q_proj(x).view(
-                B, T, self.num_heads, self.head_dim).transpose(1, 2),
+            q.view(B, T, n_heads, self.head_dim).transpose(1, 2),
             [self.nope_dim, self.rope_dim],
             dim=-1
         )
-        c, k_rope = torch.split(
-            self.kv_down(x),
-            [self.kv_latent_dim, self.rope_dim],
-            dim=-1
-        )
+        if latent == self.kv_latent_dim:
+            c, k_rope = torch.split(
+                F.linear(x, self.kv_down.weight[:, :d]),
+                [self.kv_latent_dim, self.rope_dim],
+                dim=-1
+            )
+        else:
+            # kv_down rows are [latent | rope]: nest only the latent part
+            c = F.linear(x, self.kv_down.weight[:latent, :d])
+            k_rope = F.linear(x, self.kv_down.weight[self.kv_latent_dim:, :d])
         k_rope = k_rope.view(B, T, 1, self.rope_dim).transpose(1, 2)
 
         q_rope = rotary_emb.rotate_queries_or_keys(q_rope, offset=past_length) # type: ignore
@@ -88,17 +101,18 @@ class MultiHeadedLatentAttention(nn.Module):
 
         T_k = c.shape[1]
 
-        k_nope = self.k_up(c).view(
-            B, T_k, self.num_heads, self.nope_dim).transpose(1, 2)
+        k_nope = F.linear(
+            c, self.k_up.weight[:n_heads * self.nope_dim, :latent]).view(
+            B, T_k, n_heads, self.nope_dim).transpose(1, 2)
         k_rope = k_rope.view(
             B, T_k, 1, self.rope_dim).transpose(1, 2)
-        v = self.v_up(c).view(
-            B, T_k, self.num_heads, self.head_dim).transpose(1, 2)
-
+        v = F.linear(
+            c, self.v_up.weight[:n_heads * self.head_dim, :latent]).view(
+            B, T_k, n_heads, self.head_dim).transpose(1, 2)
 
         q = torch.cat([q_nope, q_rope], dim=-1)
         k = torch.cat(
-            [k_nope, k_rope.expand(-1, self.num_heads, -1, -1)], dim=-1)
+            [k_nope, k_rope.expand(-1, n_heads, -1, -1)], dim=-1)
 
         if self.flash:
             # SDPA's is_causal aligns the mask top-left, which is only right
@@ -124,4 +138,4 @@ class MultiHeadedLatentAttention(nn.Module):
             out = att @ v
 
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
-        return self.proj(out)
+        return F.linear(out, self.proj.weight[:d, :n_heads * self.head_dim])

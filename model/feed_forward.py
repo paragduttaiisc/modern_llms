@@ -11,35 +11,52 @@ class MLPOutput(NamedTuple):
     loss: torch.Tensor | None = None
 
 
+def ffn_hidden_size(hidden_size: int, activation: str, exact: bool) -> int:
+    """Actual FFN width. SwiGLU uses 2/3 of the nominal width (same params
+    as a 2-matrix FFN), rounded up to a multiple of 256, unless `exact`
+    (used by Matryoshka-extracted models, whose width is already sliced)."""
+    if activation != "SwiGLU" or exact:
+        return hidden_size
+    hidden_size = 2 * hidden_size // 3
+    return 256 * ((hidden_size + 255) // 256)  # for efficiency
+
+
 class FeedForward(nn.Module):
-    def __init__(self, n_embed: int, hidden_size: int, activation: str, dropout: float) -> None:
+    """Dense FFN. `frac` < 1 runs the Matryoshka sub-FFN: input is the first
+    d' = x.shape[-1] dims and only the first `frac` of the hidden units are
+    used (prefix slices of the full weights)."""
+    def __init__(self, n_embed: int, hidden_size: int, activation: str, dropout: float,
+                 exact_hidden: bool = False) -> None:
         super().__init__()
         assert activation in ["GELU", "SwiGLU", "SqReLU"],\
             "Unsupported activation"
         self.act = nn.GELU(approximate="tanh") if activation == "GELU"\
                     else lambda x: F.relu(x).square()
         self.forward = self._forward_standard
+        hidden_size = ffn_hidden_size(hidden_size, activation, exact_hidden)
+        self.hidden_size = hidden_size
         if activation == "SwiGLU":
-            hidden_size = 2 * hidden_size // 3
-            hidden_size = 256 * ((hidden_size + 255) // 256) # for efficiency
             self.gate_proj = nn.Linear(n_embed, hidden_size, bias=False)
             self.forward = self._forward_SwiGLU
         self.up_proj = nn.Linear(n_embed, hidden_size, bias=False)
         self.down_proj = nn.Linear(hidden_size, n_embed, bias=False)
         self.dropout = nn.Dropout(dropout)
 
-    def _forward_SwiGLU(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.silu(self.gate_proj(x)) * self.up_proj(x)
-        x = self.down_proj(x)
+    def _forward_SwiGLU(self, x: torch.Tensor, frac: float) -> torch.Tensor:
+        d, h = x.shape[-1], round(self.hidden_size * frac)
+        x = F.silu(F.linear(x, self.gate_proj.weight[:h, :d]))\
+            * F.linear(x, self.up_proj.weight[:h, :d])
+        x = F.linear(x, self.down_proj.weight[:d, :h])
         return self.dropout(x)
 
-    def _forward_standard(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.act(self.up_proj(x))
-        x = self.down_proj(x)
+    def _forward_standard(self, x: torch.Tensor, frac: float) -> torch.Tensor:
+        d, h = x.shape[-1], round(self.hidden_size * frac)
+        x = self.act(F.linear(x, self.up_proj.weight[:h, :d]))
+        x = F.linear(x, self.down_proj.weight[:d, :h])
         return self.dropout(x)
 
-    def __call__(self, x: torch.Tensor) -> MLPOutput:
-        return MLPOutput(value=self.forward(x))
+    def __call__(self, x: torch.Tensor, frac: float = 1.0) -> MLPOutput:
+        return MLPOutput(value=self.forward(x, frac))
 
 
 class MoE(nn.Module):
@@ -51,6 +68,7 @@ class MoE(nn.Module):
         top_k: int = 2,
         activation: str = "SwiGLU",
         dropout: float = 0.0,
+        exact_hidden: bool = False,
     ) -> None:
         super().__init__()
 
@@ -74,11 +92,8 @@ class MoE(nn.Module):
 
         self.router = nn.Linear(n_embed, n_experts, bias=False)
 
-        if activation == "SwiGLU":
-            expert_hidden_size = (2 * hidden_size) // 3
-            expert_hidden_size = 256 * ((expert_hidden_size + 255) // 256)
-        else:
-            expert_hidden_size = hidden_size
+        expert_hidden_size = ffn_hidden_size(
+            hidden_size, activation, exact_hidden)
         self.hidden_size = expert_hidden_size
 
         if activation == "SwiGLU":
@@ -144,14 +159,20 @@ class MoE(nn.Module):
             start = end
         return out
 
-    def forward(self, x: torch.Tensor) -> MLPOutput:
+    def forward(self, x: torch.Tensor, frac: float = 1.0) -> MLPOutput:
+        """`frac` < 1 runs the Matryoshka sub-MoE: input is the first
+        C = x.shape[-1] dims, every expert uses only its first `frac` of
+        hidden units, and the router sees only the first C dims. All experts
+        are kept (expert count is not nested)."""
         B, T, C = x.shape
-        if C != self.n_embed:
-            raise ValueError(f"Expected input dim {self.n_embed}, got {C}")
+        if C > self.n_embed:
+            raise ValueError(f"Expected input dim <= {self.n_embed}, got {C}")
         N = B * T
+        H = self.hidden_size
+        h = round(H * frac)
 
         x_flat = x.reshape(N, C)
-        router_logits = self.router(x_flat)
+        router_logits = F.linear(x_flat, self.router.weight[:, :C])
         router_probs = F.softmax(router_logits.float(), dim=-1)
 
         topk_probs, topk_indices = torch.topk(
@@ -189,23 +210,28 @@ class MoE(nn.Module):
 
         if self.activation == "SwiGLU":
             assert self.gate_up_weight is not None
-            gate_up = self._grouped_mm(
-                x_sorted, self.gate_up_weight.transpose(-1, -2), offsets)
-            gate = gate_up[:, :self.hidden_size]
-            up = gate_up[:, self.hidden_size:]
+            if h == H and C == self.n_embed:
+                gate_up = self._grouped_mm(
+                    x_sorted, self.gate_up_weight.transpose(-1, -2), offsets)
+                gate, up = gate_up[:, :H], gate_up[:, H:]
+            else:
+                # gate_up rows are [gate (H) | up (H)]: nest each half
+                gate = self._grouped_mm(
+                    x_sorted,
+                    self.gate_up_weight[:, :h, :C].transpose(-1, -2), offsets)
+                up = self._grouped_mm(
+                    x_sorted,
+                    self.gate_up_weight[:, H:H + h, :C].transpose(-1, -2),
+                    offsets)
             hidden = F.silu(gate) * up
-        elif self.activation == "GELU":
+        else:  # GELU / SqReLU
             assert self.up_weight is not None
             hidden = self._grouped_mm(
-                x_sorted, self.up_weight.transpose(-1, -2), offsets)
-            hidden = F.gelu(hidden, approximate="tanh")
-        else:  # SqReLU
-            assert self.up_weight is not None
-            hidden = self._grouped_mm(
-                x_sorted, self.up_weight.transpose(-1, -2), offsets)
-            hidden = F.relu(hidden).square()
+                x_sorted, self.up_weight[:, :h, :C].transpose(-1, -2), offsets)
+            hidden = F.gelu(hidden, approximate="tanh")\
+                if self.activation == "GELU" else F.relu(hidden).square()
         expert_output = self._grouped_mm(
-            hidden, self.down_weight.transpose(-1, -2), offsets)
+            hidden, self.down_weight[:, :C, :h].transpose(-1, -2), offsets)
 
         expert_output *= \
             sorted_routing_weights.to(expert_output.dtype).unsqueeze(-1)

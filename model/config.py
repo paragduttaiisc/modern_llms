@@ -26,9 +26,19 @@ class ModelConfig(PreTrainedConfig):
             mtp_checkpoint: bool = True,
             draft_vocab_size: int = 0,
             mtp_position_frac: float = 1.0,
+            matryoshka_fracs: list[float] | None = None,
+            ff_hidden_exact: bool = False,
             **kwargs
     ) -> None:
         super().__init__(**kwargs)
+        # Matryoshka (nested-width) sizes trained jointly; 1.0 = full model.
+        # A size f uses the first f of d_model, attention heads, KV latent
+        # and FFN width of every block (head / RoPE dims are not nested).
+        self.matryoshka_fracs = sorted(
+            {1.0, *(matryoshka_fracs or [])}, reverse=True)
+        # Use ff_hidden_size as the exact FFN width (no SwiGLU 2/3 + round);
+        # set by Matryoshka extraction.
+        self.ff_hidden_exact = ff_hidden_exact
         # Cheaper extra MTP heads (heads 1..n-1; head 0 is never changed):
         # predict over only the `draft_vocab_size` most frequent tokens
         # (0 = full vocab), and compute their training loss on a random
@@ -56,3 +66,24 @@ class ModelConfig(PreTrainedConfig):
         self.kv_latent_size = kv_latent_size
         self.num_attention_heads = num_attention_heads
         self.num_residual_streams = num_residual_streams
+
+    def matryoshka_dims(self, frac: float) -> dict[str, int]:
+        """Nested sizes at width `frac`; raises if any is not a whole number."""
+        from .feed_forward import ffn_hidden_size
+        full = {
+            "embedding_size": self.embedding_size,
+            "num_attention_heads": self.num_attention_heads,
+            "kv_latent_size": self.kv_latent_size,
+            "ffn_hidden": ffn_hidden_size(
+                self.ff_hidden_size, self.non_linearity, self.ff_hidden_exact),
+        }
+        dims = {}
+        for name, size in full.items():
+            nested = size * frac
+            if not 0 < frac <= 1 or abs(nested - round(nested)) > 1e-6\
+                    or round(nested) < 1:
+                raise ValueError(
+                    f"Matryoshka size {frac} gives {name}={nested:g} "
+                    f"(full {size}); it must be a positive whole number")
+            dims[name] = round(nested)
+        return dims

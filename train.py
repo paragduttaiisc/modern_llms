@@ -20,6 +20,13 @@ def main(args: argparse.Namespace):
     # Setup
     torch.set_float32_matmul_precision('medium')
     set_seed(args.seed)
+    matryoshka_fracs = [float(f) for f in args.matryoshka_fracs.split(",")]
+    if len(matryoshka_fracs) > 1:
+        # torch.compile builds one graph per (size, train/eval); raise the
+        # recompile limit so it doesn't silently fall back to eager.
+        for name in ("recompile_limit", "cache_size_limit"):
+            if hasattr(torch._dynamo.config, name):
+                setattr(torch._dynamo.config, name, 64)
     os.environ["WANDB_PROJECT"] = args.wandb_project
     os.environ["WANDB_ENTITY"] = args.wandb_entity
     effective_tokens_target = args.effective_tokens_target
@@ -85,6 +92,7 @@ def main(args: argparse.Namespace):
         mtp_checkpoint=not args.no_mtp_checkpoint,
         draft_vocab_size=args.draft_vocab_size if args.n_future_tokens > 1 else 0,
         mtp_position_frac=args.mtp_position_frac,
+        matryoshka_fracs=matryoshka_fracs,
     ))
     if model.config.draft_vocab_size > 0:
         # Draft vocab of the extra MTP heads = most frequent training tokens
@@ -148,7 +156,8 @@ def main(args: argparse.Namespace):
         warmup_iters=args.warmup_iters,
         last_decay_iter=args.last_decay_iter,
         muon_lr=args.muon_lr,
-        muon_weight_decay=args.muon_weight_decay
+        muon_weight_decay=args.muon_weight_decay,
+        matryoshka_full_prob=args.matryoshka_full_prob,
     )
     if accelerator.is_main_process:
         print("Starting training...")
@@ -191,6 +200,8 @@ if __name__ == "__main__":
     parser.add_argument("--draft-vocab-size", type=int, default=0, help="Extra MTP heads predict only the N most frequent tokens (0 = full vocab)")
     parser.add_argument("--draft-vocab-file", type=str, default="data/token_counts_web_small_10B.npy", help="Token counts from scripts/token_frequencies.py")
     parser.add_argument("--mtp-position-frac", type=float, default=1.0, help="Fraction of positions used for the extra MTP heads' loss")
+    parser.add_argument("--matryoshka-fracs", type=str, default="1", help="Comma-separated nested widths trained jointly, e.g. 1,0.5,0.25 (1 = no nesting)")
+    parser.add_argument("--matryoshka-full-prob", type=float, default=0.5, help="Probability a micro-batch trains the full model (else a smaller size, uniformly)")
     parser.add_argument("--use-fused-optimizer", type=bool, default=True)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--effective-tokens-target", type=int, default=2**19)

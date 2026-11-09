@@ -47,6 +47,7 @@ utils/
   misc_utils.py              ← human_readable_numbers helper
 scripts/
   token_frequencies.py       ← Token counts for the MTP draft vocabulary
+  extract_matryoshka.py      ← Slice a smaller standalone model out of a Matryoshka checkpoint
 tokenizer/                   ← Custom tokenizer (starcoderbase base + special tokens)
 data -> /home/parag/Data/llm_data   ← Symlink to shard data
 ```
@@ -94,6 +95,7 @@ Input Embedding
 - **Hyper-connections (mHC)** — Each layer has a learnable multi-stream routing mechanism (`MHCRouter`) that expands the input into `num_residual_streams` parallel streams. Each stream goes through its own MLA + FFN path, and streams are mixed via Sinkhorn-Knopp soft attention before being collapsed back. Uses learnable pre-mixing (`h_pre`), post-mixing (`h_post`), and residual mixing (`h_res`) parameters.
 - **Multi-token prediction (MTP)** — With `--n-future-tokens=n > 1`, the last block is replaced by `n` parallel single-block heads on a shared trunk (Gloeckle et al., 2024); head `i` predicts token `t+1+i` and all heads share the tied unembedding. Loss = head-0 loss + `mtp_loss_weight` × mean of the other heads. Each head runs under activation checkpointing so only one head's `[B, T, V]` logits are alive at a time. Eval loss, perplexity and HellaSwag use head 0 only. To cut the cost of the extra heads, they can predict over only the most frequent tokens (`draft_vocab_size`; targets outside it are ignored) and compute their loss on a random fraction of positions (`mtp_position_frac`). Head 0 always uses the full vocabulary and every position.
 - **Self-speculative decoding** — The MTP heads draft the next `n-1` tokens; one forward pass verifies them with head 0 and keeps the longest matching prefix (greedy, output identical to plain greedy decoding).
+- **Matryoshka (nested-width) training** — With `--matryoshka-fracs=1,0.5,0.25`, every smaller size `f` is a prefix slice of the full model: the first `f` of d_model, attention heads, MLA KV latent and FFN width in every block (incl. MTP heads), the first `f·d` columns of the tied embedding, and RMSNorm over the prefix dims. Head and RoPE dims are not nested. Each micro-batch trains one size (the full model with probability `--matryoshka-full-prob`), and every size is evaluated separately. `scripts/extract_matryoshka.py` slices out a standalone smaller checkpoint whose outputs equal the parent at that size.
 - **Hybrid optimizer** — A single [muonium](https://pypi.org/project/muonium/) `Muon` optimizer with per-group algorithms: Muon for hidden 2-D weights (head-wise for Q / K-up / V-up) and 3-D MoE expert weights; AdamW for embeddings, the LM head, routers, mHC parameters and 1-D params. Both share one 3-phase LR schedule (warmup → cosine decay → constant plateau at 0.1×), with separate base LRs.
 
 </details>
@@ -155,7 +157,7 @@ The SLURM script (`run.sh`) is configured for 4 H200 GPUs with bf16, batch=80, a
 
 ### Multi-token prediction
 
-Add `--n-future-tokens=4` to train 4 parallel prediction heads (`--mtp-loss-weight` scales the extra heads; `--no-mtp-checkpoint` trades memory for speed). Per-head training losses are logged as `mtp_loss_1..n`.
+Add `--n-future-tokens=4` to train 4 parallel prediction heads (`--mtp-loss-weight` scales the extra heads; `--no-mtp-checkpoint` trades memory for speed). Alongside the total `loss`, training logs the next-token loss as `lm_loss`, the mean of the extra heads as `mtp_loss`, and each head as `mtp_loss_1..n`.
 
 To make the extra heads cheaper, first count token frequencies on the training data, then restrict heads 2..n to the most frequent tokens and a random half of the positions:
 
@@ -166,6 +168,18 @@ accelerate launch --num_processes=8 --mixed_precision=bf16 train.py --n-experts=
 ```
 
 On a 1B-token sample of `web_small_10B`, the top 8,192 tokens cover 95.6% of tokens and the top 16,384 cover 99.25%.
+
+### Matryoshka (nested sizes)
+
+Train the full model and nested 1/2- and 1/4-width models together (combinable with MTP), then extract a smaller standalone model:
+
+```bash
+accelerate launch --num_processes=8 --mixed_precision=bf16 train.py --n-experts=1 --matryoshka-fracs=1,0.5,0.25 \
+    --wandb-run-name="<RunName>"
+python scripts/extract_matryoshka.py --save-dir=outputs/checkpoint-xxx --frac=0.25 --out=outputs/checkpoint-xxx-f0.25
+```
+
+Every size must give whole-number dimensions (e.g. 768·f, 12·f heads, 128·f latent, FFN width·f). Per-size losses are logged with an `_f<size>` suffix (e.g. `lm_loss_f0.25`, `eval_f0.25_loss`).
 
 ### Plain MLP
 
@@ -199,6 +213,8 @@ accelerate launch --num_processes=8 --mixed_precision=bf16 train.py --use-bf16 -
 | `--draft-vocab-size` | 0 | Heads 2..n predict only the N most frequent tokens (0 = full vocab) |
 | `--draft-vocab-file` | `data/token_counts_web_small_10B.npy` | Token counts from `scripts/token_frequencies.py` |
 | `--mtp-position-frac` | 1.0 | Fraction of positions used for the loss of heads 2..n |
+| `--matryoshka-fracs` | `1` | Comma-separated nested widths trained jointly (1 = no nesting) |
+| `--matryoshka-full-prob` | 0.5 | Probability a micro-batch trains the full model (else a smaller size, uniformly) |
 | `--n-res-streams` | 1 | Number of residual streams for mHC routing (1 = plain residual) |
 | `--effective-tokens-target` | 2^19 | Target tokens for gradient accumulation calculation |
 | `--muon-lr` | 0.02 | Muon optimizer learning rate |
@@ -213,7 +229,7 @@ python infer.py --save-dir=models/checkpoint-xxx --prompt "Hello" --use-cache \
     --max-new-tokens=1000 --temperature=0.9 --num-return-sequences=3
 ```
 
-Add `--use-cache` to enable KV caching (speeds up autoregressive generation). Throughput is benchmarked automatically.
+Add `--matryoshka-frac=0.25` to extract and run a smaller nested size of a Matryoshka checkpoint (works with `--speculative`). Add `--use-cache` to enable KV caching (speeds up autoregressive generation). Throughput is benchmarked automatically.
 
 For an MTP checkpoint, compare greedy decoding with self-speculative decoding (reports tokens per forward pass, draft acceptance and speedup):
 
@@ -256,6 +272,7 @@ Logs are sent to WandB (online/offline) or TensorBoard, tracking loss, perplexit
 - [x] MLP/MoE toggle — `--n-experts=1` for plain MLP, `n_experts > 1` for MoE
 - [x] Hyper-connections (mHC) — learnable multi-stream routing with Sinkhorn-Knopp attention
 - [x] Multi-token prediction (parallel heads) with self-speculative decoding
+- [x] Matryoshka nested-width training (d_model, heads, MLA latent, FFN) with extraction of smaller models
 
 ### Planned 🚧
 

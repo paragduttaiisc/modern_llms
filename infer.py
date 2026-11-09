@@ -64,7 +64,12 @@ def main(args: argparse.Namespace):
     # Register and load model
     AutoConfig.register("modern_transformer", ModelConfig)
     AutoModelForCausalLM.register(ModelConfig, Model)
-    model = Model.from_pretrained(args.save_dir).to(args.device)
+    model = Model.from_pretrained(args.save_dir)
+    if args.matryoshka_frac < 1.0:
+        model = model.extract_matryoshka(args.matryoshka_frac)
+        print(f"Extracted Matryoshka size {args.matryoshka_frac:g}: "
+              f"{sum(p.numel() for p in model.parameters()) / 1e6:.1f}M params")
+    model = model.to(args.device)
     model.eval()
     tokenizer = get_tokenizer()
     if args.speculative:
@@ -140,6 +145,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-return-sequences", type=int, default=3)
     parser.add_argument("--speculative", action="store_true", help="Benchmark greedy vs. MTP self-speculative decoding (needs an MTP checkpoint)")
     parser.add_argument("--ignore-eos", action="store_true", help="Keep generating past EOS (for fixed-length benchmarks)")
+    parser.add_argument("--matryoshka-frac", type=float, default=1.0, help="Run a smaller nested size (extracted from a Matryoshka checkpoint)")
     args = parser.parse_args()
     set_seed(args.seed)
     main(args)

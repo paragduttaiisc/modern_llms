@@ -1,5 +1,6 @@
 import math
 import os
+import random
 import time
 
 import torch
@@ -21,9 +22,21 @@ class LLMTrainer(Trainer):
             last_decay_iter: int = 50000,
             muon_lr: float = 0.02,
             muon_weight_decay: float = 0.01,
+            matryoshka_full_prob: float = 0.5,
             **kwargs
     ) -> None:
         super().__init__(*args, **kwargs)
+
+        # Matryoshka: each micro-batch trains one nested width, the full
+        # model with probability `matryoshka_full_prob`, otherwise a smaller
+        # size uniformly. A dedicated RNG seeded identically on every rank
+        # keeps all ranks on the same size (so no rank waits on a bigger one).
+        self.matryoshka_fracs = list(getattr(
+            self.model.config, "matryoshka_fracs", [1.0]))
+        self.matryoshka_full_prob = matryoshka_full_prob
+        self._matryoshka_rng = random.Random(self.args.seed)
+        # Per-size sums of per-token losses since the last log (see log())
+        self._loss_window: dict[float, dict] = {}
 
         self.block_size = block_size
         self.warmup_iters = warmup_iters
@@ -181,8 +194,32 @@ class LLMTrainer(Trainer):
 
         return self.lr_scheduler
 
+    def _sample_matryoshka_frac(self) -> float:
+        smaller = self.matryoshka_fracs[1:]  # sorted descending, [0] == 1.0
+        if not smaller or\
+                self._matryoshka_rng.random() < self.matryoshka_full_prob:
+            return 1.0
+        return self._matryoshka_rng.choice(smaller)
+
     def training_step(self, model, inputs, *args, **kwargs) -> torch.Tensor:
-        loss = super().training_step(model, inputs, *args, **kwargs)
+        frac = self._sample_matryoshka_frac()
+        self.model.active_frac = frac  # type: ignore
+        try:
+            loss = super().training_step(model, inputs, *args, **kwargs)
+        finally:
+            self.model.active_frac = 1.0  # type: ignore  (eval/generation)
+        # Sum the per-token losses of this micro-batch into the current
+        # logging window (detached tensors: no GPU sync here).
+        window = self._loss_window.setdefault(
+            frac, {"n": 0, "lm": None, "mtp": None})
+        lm = getattr(self.model, "last_lm_loss", None)
+        mtp = getattr(self.model, "last_mtp_losses", None)\
+            if getattr(self.model.config, "n_future_tokens", 1) > 1 else None
+        window["n"] += 1
+        for key, value in (("lm", lm), ("mtp", mtp)):
+            if value is not None:
+                window[key] = value if window[key] is None\
+                    else window[key] + value
 
         if "input_ids" in inputs:
             local_tokens = inputs["input_ids"].numel()
@@ -244,6 +281,18 @@ class LLMTrainer(Trainer):
             ignore_keys=ignore_keys,
             metric_key_prefix=metric_key_prefix,
         )
+        # Eval loss of every smaller Matryoshka size, logged as
+        # eval_f<size>_loss / eval_f<size>_perplexity
+        for frac in self.matryoshka_fracs[1:]:
+            self.model.active_frac = frac  # type: ignore
+            try:
+                metrics.update(super().evaluate(
+                    eval_dataset=eval_dataset,
+                    ignore_keys=ignore_keys,
+                    metric_key_prefix=f"{metric_key_prefix}_f{frac:g}",
+                ))
+            finally:
+                self.model.active_frac = 1.0  # type: ignore
 
         self.model.eval() # type: ignore
         hellaswag_acc = self.evaluate_hellaswag()
@@ -260,10 +309,45 @@ class LLMTrainer(Trainer):
 
         return metrics
 
+    def _log_window_losses(self, logs: dict) -> None:
+        """Log the components of HF's `loss` next to it (like router_loss).
+
+        `loss` (HF) stays the optimized objective averaged over the logging
+        window: it includes the extra MTP heads, the MoE router loss, and,
+        with Matryoshka, every size. Added, as window means of per-token
+        losses:
+          - `lm_loss`: the full model's next-token loss (head 1)
+          - `mtp_loss`: unweighted mean of the extra heads 2..n, so
+            loss ~= lm_loss + mtp_loss_weight * mtp_loss
+                    + router_loss_coef * router_loss
+          - `mtp_loss_<k>`: head k alone (predicts token t+k)
+          - `_f<size>` variants of all of these for smaller Matryoshka sizes
+        Window means are averaged over all ranks, like HF's loss. HF calls
+        log() with "loss" on every rank (right after its own all-gather), and
+        every rank trains the same sizes in the same order, so the
+        reductions below line up across ranks.
+        """
+        window, self._loss_window = self._loss_window, {}
+        for frac, sums in sorted(window.items(), reverse=True):
+            if sums["lm"] is None:
+                continue
+            suffix = "" if frac == 1.0 else f"_f{frac:g}"
+            # [next-token, head 1..n] means of this window, then over ranks
+            means = sums["lm"].reshape(1) if sums["mtp"] is None\
+                else torch.cat([sums["lm"].reshape(1), sums["mtp"]])
+            means = self.accelerator.reduce(
+                means.float() / sums["n"], reduction="mean").tolist()
+            logs[f"lm_loss{suffix}"] = means[0]
+            if len(means) > 2:
+                logs[f"mtp_loss{suffix}"] = sum(means[2:]) / len(means[2:])
+                for i, head_loss in enumerate(means[1:]):
+                    logs[f"mtp_loss_{i + 1}{suffix}"] = head_loss
+
     def log(self, logs: dict, *args, **kwargs) -> None:
         logs.pop("learning_rate", None)
 
         if "loss" in logs:
+            self._log_window_losses(logs)
             elapsed = time.time() - self.log_start_time
             if elapsed > 0:
                 current_step = self.state.global_step
@@ -276,15 +360,8 @@ class LLMTrainer(Trainer):
                     logs["iter_time"] = elapsed / steps_passed
                     logs["samples_per_sec"] =\
                         (tokens_passed / self.block_size) / elapsed
-                    if hasattr(self.model, "last_lm_loss"):
-                        logs["lm_loss"] = self.model.last_lm_loss.item() # type: ignore
                     if hasattr(self.model, "last_router_loss") and self.model.last_router_loss: # type: ignore
                         logs["router_loss"] = self.model.last_router_loss.item() # type: ignore
-                    mtp_losses = getattr(self.model, "last_mtp_losses", None)
-                    if mtp_losses is not None:
-                        # head i predicts token t+1+i; head 0 == lm_loss
-                        for i, head_loss in enumerate(mtp_losses.tolist()):
-                            logs[f"mtp_loss_{i + 1}"] = head_loss
                     if getattr(self.model.config, "experts", 1) > 1: # type: ignore
                         avg_load = torch.stack([layer.ffn.last_load.float() for layer in self.model.layers]).mean(0) # type: ignore
                         avg_tokens = torch.stack([layer.ffn.last_num_tokens.float() for layer in self.model.layers]).mean(0) # type: ignore
@@ -315,13 +392,10 @@ class LLMTrainer(Trainer):
                     adamw_lr = next(iter(adamw_lrs))
                     logs["adamw_lr"] = adamw_lr.item() if type(adamw_lr) == torch.Tensor else adamw_lr
 
-            # With MTP, "loss" includes the extra heads, so next-token
-            # perplexity uses lm_loss (last micro-batch, hence noisier).
-            ppl_loss = logs["lm_loss"]\
-                if getattr(self.model.config, "n_future_tokens", 1) > 1\
-                and "lm_loss" in logs else logs["loss"]
+            # Next-token perplexity: from lm_loss, since "loss" can include
+            # MTP heads, router loss and smaller Matryoshka sizes.
             try:
-                logs["perplexity"] = math.exp(ppl_loss)
+                logs["perplexity"] = math.exp(logs.get("lm_loss", logs["loss"]))
             except OverflowError:
                 logs["perplexity"] = float("inf")
 
@@ -329,10 +403,12 @@ class LLMTrainer(Trainer):
             self.log_start_tokens = self.total_tokens
             self.log_start_steps = self.state.global_step
 
-        if "eval_loss" in logs:
+        # eval_loss and Matryoshka eval_f<size>_loss -> *_perplexity
+        for key in [k for k in logs if k.startswith("eval")
+                    and k.endswith("_loss")]:
             try:
-                logs["eval_perplexity"] = math.exp(logs["eval_loss"])
+                logs[key[:-len("loss")] + "perplexity"] = math.exp(logs[key])
             except OverflowError:
-                logs["eval_perplexity"] = float("inf")
+                logs[key[:-len("loss")] + "perplexity"] = float("inf")
 
         super().log(logs, *args, **kwargs)
