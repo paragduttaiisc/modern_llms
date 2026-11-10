@@ -21,6 +21,15 @@ def prefix_rms_norm(norm: nn.RMSNorm, x: torch.Tensor) -> torch.Tensor:
 
 
 class ResidualConnection(nn.Module):
+    """Residual connection around one sub-layer (attention or FFN).
+
+    With `n_streams == 1` it is the ordinary residual: `collapse` returns
+    the hidden state unchanged and `expand(x, y)` is `x + y`. With more
+    streams it wraps an `MHCRouter` (hyper-connections): the hidden state
+    is [B, T, S, C], `collapse` mixes the S streams into the sub-layer's
+    [B, T, C] input, and `expand` mixes the streams and writes the
+    sub-layer's output back into each of them.
+    """
     def __init__(self, embedding_size: int, n_streams: int):
         super().__init__()
 
@@ -35,17 +44,30 @@ class ResidualConnection(nn.Module):
             )
 
     def collapse(self, x):
+        """Sub-layer input from the residual state ([B, T, C])."""
         if self.mhc is None:
             return x
         return self.mhc.collapse(x)
 
     def expand(self, x, y):
+        """New residual state from the old one `x` and sub-layer output
+        `y` [B, T, C]."""
         if self.mhc is None:
             return x + y
         return self.mhc(x, y)
 
 
 class Block(nn.Module):
+    """One pre-norm transformer block:
+        x = x + MLA(RMSNorm(x))
+        x = x + FFN_or_MoE(RMSNorm(x))
+    Pre-norm (normalizing the sub-layer input, not the residual) keeps an
+    un-normalized path from the embeddings to the output, which makes deep
+    stacks train stably. RMSNorm rescales by the root mean square only (no
+    mean subtraction, no bias), which is cheaper than LayerNorm and works
+    as well. The "+" is a `ResidualConnection` (plain add, or mHC streams).
+    `n_experts == 1` selects the dense FFN, otherwise an MoE layer.
+    """
     def __init__(
             self,
             embedding_size: int,
@@ -116,7 +138,14 @@ class Block(nn.Module):
             layer_idx: int | None = None,
             frac: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """`frac` < 1: Matryoshka sub-block on the first d' = x.shape[-1]
+        """Run the block on x [B, T, C] (or [B, T, S, C] with mHC streams).
+
+        Returns `(x, aux_loss)`: the new hidden state, same shape as the
+        input, and the MoE's unscaled load-balancing loss (None for a dense
+        FFN). The cache arguments are passed through to the attention (see
+        `MultiHeadedLatentAttention.forward`).
+
+        `frac` < 1: Matryoshka sub-block on the first d' = x.shape[-1]
         residual dims (heads / latent / FFN width scaled by `frac`)."""
         if frac < 1.0 and self.attn_residual.mhc is not None:
             raise NotImplementedError("Matryoshka nesting with mHC streams")

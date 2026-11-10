@@ -4,19 +4,23 @@
         --frac=0.25 --out=outputs/<run>/checkpoint-XXXX-f0.25
 
 The result is a normal checkpoint (load with Model.from_pretrained, run with
-infer.py) whose outputs equal the parent run at width `frac`.
+infer.py) whose outputs equal the parent run at width `frac`. Size f keeps
+the first f of the residual width, attention heads, MLA latent and FFN width
+(prefix slices of every weight); head and RoPE dims are unchanged.
 """
 import argparse
 import os
 import sys
 
+# Make the repo root importable when run as `python scripts/...`
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from model import Model  # noqa: E402
-from utils.misc_utils import human_readable_numbers as hrn  # noqa: E402
+from model import Model
+from utils.misc_utils import human_readable_numbers as hrn
 
 
 def main(args: argparse.Namespace) -> None:
+    """Load `--save-dir`, slice it to width `--frac` and save it to `--out`."""
     model = Model.from_pretrained(args.save_dir)
     small = model.extract_matryoshka(args.frac)
     small.save_pretrained(args.out)
@@ -29,7 +33,7 @@ def main(args: argparse.Namespace) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n")[0])
     parser.add_argument("--save-dir", type=str, required=True)
     parser.add_argument("--frac", type=float, required=True)
     parser.add_argument("--out", type=str, required=True)

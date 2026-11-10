@@ -1,0 +1,9 @@
+# Ruff settings for this repository (`ruff check .`).
+
+[lint]
+# Ruff >= 0.16 no longer enables E402 / E731 by default; keep checking them so
+# the `noqa` markers on the intentional exceptions stay meaningful.
+extend-select = ["E402", "E731"]
+# Files on NTFS/exFAT mounts all show as executable, which would trigger
+# "executable file without a shebang" for every module.
+ignore = ["EXE002"]

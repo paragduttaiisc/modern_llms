@@ -1,3 +1,4 @@
 {
-    "typeCheckingMode": "off"
+    "typeCheckingMode": "standard",
+    "pythonVersion": "3.12"
 }

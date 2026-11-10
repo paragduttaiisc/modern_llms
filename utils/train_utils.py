@@ -1,7 +1,26 @@
+"""`LLMTrainer`: the HuggingFace `Trainer` customized for LLM pretraining.
+
+HF's `Trainer` already handles the training loop, gradient accumulation,
+mixed precision, distributed training (through Accelerate), checkpointing
+and logging. This subclass replaces or extends the parts that are specific
+to this project:
+
+- the optimizer: Muon for the hidden 2-D/3-D weight matrices and AdamW for
+  everything else, in one `muonium.Muon` optimizer (`create_optimizer`);
+- the LR schedule: linear warmup, cosine decay, then a constant floor
+  (`create_scheduler`);
+- Matryoshka training: which nested width each micro-batch trains
+  (`training_step`, `_sample_matryoshka_frac`);
+- evaluation: eval loss of every Matryoshka size plus HellaSwag accuracy
+  (`evaluate`, `evaluate_hellaswag`);
+- logging: throughput, loss components, LRs and MoE expert statistics
+  (`log`, `_log_window_losses`).
+"""
 import math
 import os
 import random
 import time
+from typing import Any, cast
 
 import torch
 from muonium import Muon
@@ -21,9 +40,22 @@ class MuonFP32State(Muon):
     the parameter dtype (bf16 here). The weights stay bf16: each AdamW step
     runs on fp32 copies of the weights and gradients, and the result is
     rounded back into the bf16 weights. Works on FSDP2 (DTensor) params too.
+
+    Why: AdamW's second moment (a running mean of squared gradients) can
+    span many orders of magnitude, and bf16's 8-bit mantissa loses small
+    updates to it. The fp32 moments double the AdamW state memory, but only
+    for the AdamW params (embeddings, norms, routers). Muon groups are
+    untouched.
     """
 
     def _step_adam_group(self, group: dict) -> None:
+        """One AdamW step for `group`, overriding muonium's version.
+
+        Gathers the params that have a gradient, lazily creates fp32
+        `exp_avg` / `exp_avg_sq` state, runs `torch.optim.adam`'s functional
+        foreach kernel on fp32 copies of weights and gradients, and copies
+        the updated fp32 weights back into the (bf16) parameters in place.
+        """
         params, params32, grads32, exp_avgs, exp_avg_sqs, steps =\
             [], [], [], [], [], []
         for p in group["params"]:
@@ -37,6 +69,8 @@ class MuonFP32State(Muon):
             for key in ("exp_avg", "exp_avg_sq"):  # older bf16 checkpoints
                 if state[key].dtype != torch.float32:
                     state[key] = state[key].float()
+            # Loading a checkpoint can map the step counter onto the GPU;
+            # the non-capturable `adam` path expects CPU step tensors.
             if state["step"].device.type != "cpu":
                 state["step"] = state["step"].cpu()
             params.append(p)
@@ -47,6 +81,7 @@ class MuonFP32State(Muon):
             steps.append(state["step"])
         if not params:
             return
+        # lr / wd can be tensors in the group; `adam` is given floats.
         lr, wd = group["lr"], group["wd"]
         beta1, beta2 = group["betas"]
         adam(
@@ -64,6 +99,29 @@ class MuonFP32State(Muon):
 
 
 class LLMTrainer(Trainer):
+    """HF `Trainer` with Muon/AdamW, a cosine schedule, Matryoshka training,
+    HellaSwag eval and extra logging (see the module docstring).
+
+    Used with `Model` from `model/model.py` and `TokenDataset`. Beyond the
+    standard `Trainer` arguments it takes:
+
+    Args:
+        block_size: sequence length, used to turn tokens/s into samples/s.
+        warmup_iters: optimizer steps of linear LR warmup.
+        last_decay_iter: step where the cosine decay reaches 0.1x the peak
+            LR; the LR stays there afterwards.
+        muon_lr: peak LR of the Muon groups. The AdamW groups use
+            `args.learning_rate`; both follow the same schedule multiplier.
+        muon_weight_decay: weight decay of the Muon groups. The decayed
+            AdamW group uses `args.weight_decay`.
+        matryoshka_full_prob: probability that a micro-batch trains the full
+            width (only with more than one `matryoshka_fracs`).
+        matryoshka_full_per_step: make the first micro-batch of every
+            optimizer step full width (see `_sample_matryoshka_frac`).
+        matryoshka_all_sizes: train every width on every micro-batch instead
+            of sampling one.
+    """
+
     def __init__(
             self,
             *args,
@@ -84,7 +142,7 @@ class LLMTrainer(Trainer):
         # size uniformly. A dedicated RNG seeded identically on every rank
         # keeps all ranks on the same size (so no rank waits on a bigger one).
         self.matryoshka_fracs = list(getattr(
-            self.model.config, "matryoshka_fracs", [1.0]))
+            self._llm.config, "matryoshka_fracs", [1.0]))
         self.matryoshka_full_prob = matryoshka_full_prob
         self._matryoshka_rng = random.Random(self.args.seed)
         # Every optimizer step contains a full-size micro-batch (the first);
@@ -117,7 +175,43 @@ class LLMTrainer(Trainer):
         self.log_start_tokens = 0
         self.log_start_steps = 0
 
-    def create_optimizer(self) -> torch.optim.Optimizer:
+    @property
+    def _llm(self) -> Any:
+        """`self.model`, typed loosely for the type checker.
+
+        HF types `Trainer.model` as an optional generic module; this trainer
+        always holds this repo's `Model`, whose config and logging
+        attributes are read below.
+        """
+        return self.model
+
+    def create_optimizer(
+            self, model: torch.nn.Module | None = None,
+    ) -> torch.optim.Optimizer:
+        """Build one Muon optimizer whose param groups use Muon or AdamW.
+
+        Muon (MomentUm Orthogonalized by Newton-Schulz) replaces each 2-D
+        weight's momentum-averaged gradient by its nearest semi-orthogonal
+        matrix, an update with all singular values equal. It suits hidden
+        weight matrices; embeddings, the LM head (tied to the embeddings),
+        routers, mHC projections, norm gains and biases keep AdamW.
+
+        Params are routed by name and shape, so a new module must be checked
+        against these rules (the summary printed on rank 0 shows the split):
+          - 3-D params (stacked MoE expert weights `[E, out, in]`): Muon with
+            `flatten=False`, i.e. each expert's matrix orthogonalized alone;
+          - `q_proj` / `k_up` / `v_up` weights: head-wise Muon, the rows
+            split into one block per attention head (`split_sizes`) and each
+            block orthogonalized separately;
+          - other 2-D weights: Muon, unless the name contains `router`,
+            `mhc`, `emb` or `lm_head`;
+          - everything else: AdamW, with weight decay for >= 2-D params and
+            without for 1-D params (norm gains, biases).
+
+        `model` is the prepared model HF passes when it creates the optimizer
+        after wrapping the model; otherwise `self.model` is used. Returns the
+        existing optimizer if one was already created.
+        """
         if self.optimizer is not None:
             return self.optimizer
 
@@ -129,16 +223,24 @@ class LLMTrainer(Trainer):
         adamw_decay_params = []
         adamw_nodecay_params = []
 
-        n_heads = self.model.config.num_attention_heads
-        head_dim = self.model.config.sa_head_size
-        rope_dim = self.model.config.rope_size
+        n_heads = self._llm.config.num_attention_heads
+        head_dim = self._llm.config.sa_head_size
+        rope_dim = self._llm.config.rope_size
         nope_dim = head_dim - rope_dim
 
+        # Row counts per head of each attention up-projection. `q_proj` rows
+        # are [head 0 | head 1 | ...], each head_dim wide (nope + rope); `k_up`
+        # only produces the nope part of K (the rope part comes from
+        # `kv_down`); `v_up` gives full-width V heads.
         q_split_sizes = (head_dim,) * n_heads
         k_up_split_sizes = (nope_dim,) * n_heads
         v_up_split_sizes = (head_dim,) * n_heads
 
-        for name, p in self.model.named_parameters():
+        # HF passes the prepared (possibly wrapped) model when it delays
+        # optimizer creation, e.g. for some FSDP setups. Parameter names keep
+        # their substrings either way, so the routing rules still apply.
+        opt_model = model if model is not None else self._llm
+        for name, p in opt_model.named_parameters():
             if not p.requires_grad:
                 continue
 
@@ -178,7 +280,9 @@ class LLMTrainer(Trainer):
                 adamw_nodecay_params.append(p)
 
         if int(os.environ.get("LOCAL_RANK", 0)) == 0:  # noqa: PLW1508
-            sum_p = lambda params: sum(p.numel() for p in params)
+            def sum_p(params):
+                return sum(p.numel() for p in params)
+
             print(
                 f"Muon (2D): {len(muon_2d_params)} tensors, "
                 f"{hrn(sum_p(muon_2d_params))} params\n"
@@ -195,6 +299,8 @@ class LLMTrainer(Trainer):
                 f"AdamW (No Decay): {len(adamw_nodecay_params)} tensors, "
                 f"{hrn(sum_p(adamw_nodecay_params))} params")
 
+        # Muon groups take `lr` / `wd` from the constructor defaults below;
+        # AdamW groups override them with the HF TrainingArguments values.
         self.optimizer = MuonFP32State([{
             "params": muon_2d_params,
             "algorithm": "muon",
@@ -238,6 +344,16 @@ class LLMTrainer(Trainer):
         num_training_steps: int,
         optimizer: torch.optim.Optimizer | None = None,
     ) -> torch.optim.lr_scheduler.LRScheduler:
+        """Linear warmup, cosine decay to 0.1x, then constant 0.1x.
+
+        One `LambdaLR` multiplier is shared by every param group, so Muon
+        and AdamW groups keep the ratio of their peak LRs throughout:
+          - steps [0, warmup_iters): linear from ~0 to 1;
+          - steps [warmup_iters, last_decay_iter): cosine from 1 to 0.1;
+          - afterwards: 0.1.
+        `num_training_steps` (HF's argument) is not used; the schedule is
+        set by `warmup_iters` and `last_decay_iter` alone.
+        """
         if self.lr_scheduler is not None:
             return self.lr_scheduler
 
@@ -251,6 +367,7 @@ class LLMTrainer(Trainer):
                 if warmup_iters == 0:
                     return 1.0
                 progress = step / warmup_iters
+                # Starts at 1e-6 rather than 0 so step 0 is not a no-op
                 return 1e-6 + (1.0 - 1e-6) * progress
             if step < decay_end:
                 decay_progress =\
@@ -264,6 +381,20 @@ class LLMTrainer(Trainer):
         return self.lr_scheduler
 
     def _sample_matryoshka_frac(self) -> float:
+        """Width fraction for the next training micro-batch.
+
+        Returns 1.0 (full model) with probability `matryoshka_full_prob`,
+        otherwise one of the smaller fractions uniformly at random. Called
+        once per micro-batch on every rank; the shared seed and identical
+        call order give every rank the same sequence of sizes.
+
+        With `matryoshka_full_per_step`, micro-batch 0 of each optimizer
+        step (of k = gradient_accumulation_steps) is always full size, and
+        the other k-1 are full with probability p' chosen so the overall
+        share is unchanged: (1 + (k-1) p') / k = p, i.e.
+        p' = (p k - 1) / (k - 1), clipped at 0. With k = 1 every micro-batch
+        is full size.
+        """
         smaller = self.matryoshka_fracs[1:]  # sorted descending, [0] == 1.0
         if not smaller:
             return 1.0
@@ -280,6 +411,18 @@ class LLMTrainer(Trainer):
         return self._matryoshka_rng.choice(smaller)
 
     def training_step(self, model, inputs, *args, **kwargs) -> torch.Tensor:
+        """One micro-batch: forward, backward and loss bookkeeping.
+
+        Sets which Matryoshka width(s) the model trains on this micro-batch,
+        runs HF's `training_step` (forward + backward), and always resets the
+        model to full width afterwards, since eval and generation use
+        `model.active_frac`. Then adds the model's per-token loss components
+        (`last_lm_loss`, `last_mtp_losses`) to the logging window and counts
+        the tokens seen by all ranks for the tokens/s metric.
+
+        Returns HF's loss for this micro-batch (scaled for gradient
+        accumulation, as HF expects).
+        """
         if self.matryoshka_all_sizes:
             frac = 1.0
             self.model.train_fracs = self.matryoshka_fracs  # type: ignore
@@ -294,10 +437,10 @@ class LLMTrainer(Trainer):
         # Sum the per-token losses of this micro-batch into the current
         # logging window (detached tensors: no GPU sync here).
         if self.matryoshka_all_sizes:
-            per_size = self.model.last_losses_by_frac  # type: ignore
+            per_size = self._llm.last_losses_by_frac
         else:
             mtp = getattr(self.model, "last_mtp_losses", None)\
-                if getattr(self.model.config, "n_future_tokens", 1) > 1\
+                if getattr(self._llm.config, "n_future_tokens", 1) > 1\
                 else None
             per_size = {frac: (getattr(self.model, "last_lm_loss", None), mtp)}
         for size, (lm, mtp) in per_size.items():
@@ -309,6 +452,8 @@ class LLMTrainer(Trainer):
                     window[key] = value if window[key] is None\
                         else window[key] + value
 
+        # Assumes every rank gets a batch of the same size, so the global
+        # token count is the local one times the world size.
         if "input_ids" in inputs:
             local_tokens = inputs["input_ids"].numel()
             world_size =\
@@ -318,6 +463,16 @@ class LLMTrainer(Trainer):
 
     @torch.no_grad()
     def evaluate_hellaswag(self) -> float:
+        """Zero-shot HellaSwag accuracy over the whole tokenized val set.
+
+        Each example has 4 candidate sequences (shared context + one ending),
+        with the correct one first. The model scores each candidate by its
+        mean per-token loss (`return_per_sample_loss=True`), and an example
+        counts as correct when candidate 0 has the lowest loss. The loader
+        is sharded across ranks by Accelerate and the counts are summed over
+        ranks, so every rank returns the same accuracy. Runs at the model's
+        current `active_frac` (full size when called from `evaluate`).
+        """
         dataset = HellaswagDataset(
             "data/Hellaswag/hellaswag_tokenized.npy"
         )
@@ -345,6 +500,7 @@ class LLMTrainer(Trainer):
 
             outputs = self.model(**batch, return_per_sample_loss=True) # type: ignore
 
+            # outputs.loss: [B * 4] per-candidate losses -> [B, 4]
             preds = outputs.loss.reshape(-1, 4).argmin(dim=1)
 
             local_correct += (preds == 0).sum().item()
@@ -364,6 +520,17 @@ class LLMTrainer(Trainer):
         ignore_keys=None,
         metric_key_prefix="eval",
     ):
+        """HF eval loss for every Matryoshka size, plus HellaSwag accuracy.
+
+        Runs HF's `evaluate` at full width (keys `eval_loss`, ...), then once
+        per smaller width with keys `eval_f<size>_*`, then HellaSwag on the
+        full model (`eval_hellaswag_acc`, also logged). The model is left at
+        full width in train mode, and the CUDA cache is emptied at the end.
+        Note that in eval mode `Model` uses only head 0, so eval losses of
+        MTP runs are comparable to dense next-token baselines.
+
+        Returns the merged metrics dict.
+        """
         metrics = super().evaluate(
             eval_dataset=eval_dataset,
             ignore_keys=ignore_keys,
@@ -423,8 +590,8 @@ class LLMTrainer(Trainer):
             # [next-token, head 1..n] means of this window, then over ranks
             means = sums["lm"].reshape(1) if sums["mtp"] is None\
                 else torch.cat([sums["lm"].reshape(1), sums["mtp"]])
-            means = self.accelerator.reduce(
-                means.float() / sums["n"], reduction="mean").tolist()
+            means = cast(torch.Tensor, self.accelerator.reduce(
+                means.float() / sums["n"], reduction="mean")).tolist()
             logs[f"lm_loss{suffix}"] = means[0]
             if len(means) > 2:
                 logs[f"mtp_loss{suffix}"] = sum(means[2:]) / len(means[2:])
@@ -432,6 +599,16 @@ class LLMTrainer(Trainer):
                     logs[f"mtp_loss_{i + 1}{suffix}"] = head_loss
 
     def log(self, logs: dict, *args, **kwargs) -> None:
+        """Add project metrics to HF's logs before they are reported.
+
+        On training logs (those with "loss"): the per-window loss components
+        (`_log_window_losses`), throughput since the previous log (tokens/s,
+        iters/s, iter time, samples/s), the router loss and per-expert MoE
+        stats of the last micro-batch, the current Muon and AdamW LRs, and
+        `perplexity` = exp(lm_loss). For every `eval*_loss` key, the matching
+        `eval*_perplexity` is added. HF's single `learning_rate` is dropped,
+        since the two optimizer families have different LRs.
+        """
         logs.pop("learning_rate", None)
 
         if "loss" in logs:
@@ -450,6 +627,9 @@ class LLMTrainer(Trainer):
                         (tokens_passed / self.block_size) / elapsed
                     if hasattr(self.model, "last_router_loss") and self.model.last_router_loss: # type: ignore
                         logs["router_loss"] = self.model.last_router_loss.item() # type: ignore
+                    # Per-expert load / token count / router importance,
+                    # averaged over the trunk's MoE layers. These come from
+                    # the last forward on this rank only (not reduced).
                     if getattr(self.model.config, "experts", 1) > 1: # type: ignore
                         avg_load = torch.stack([layer.ffn.last_load.float() for layer in self.model.layers]).mean(0) # type: ignore
                         avg_tokens = torch.stack([layer.ffn.last_num_tokens.float() for layer in self.model.layers]).mean(0) # type: ignore
@@ -459,6 +639,8 @@ class LLMTrainer(Trainer):
                             logs[f"expert_{i}_tokens"] = avg_tokens[i].item()
                             logs[f"expert_{i}_importance"] = avg_importance[i].item()
 
+            # All groups of one algorithm share a peak LR and the scheduler
+            # multiplier, so any one group's LR represents the family.
             if self.optimizer is not None:
                 muon_lrs = {
                     group["lr"]

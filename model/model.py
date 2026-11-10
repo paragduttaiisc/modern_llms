@@ -1,5 +1,6 @@
 import copy
 import math
+from typing import cast
 
 import torch
 import torch.nn.functional as F
@@ -24,15 +25,49 @@ class Model(PreTrainedModel, GenerationMixin):
     `t + 1 + i`. All heads share the tied unembedding. Head 0 is the
     next-token head, so the next-token path is still `num_hidden_layers`
     blocks deep.
+
+    Data flow: token ids [B, T] -> embedding [B, T, C] -> trunk blocks
+    (MLA attention + dense FFN or MoE, see `layer.Block`) -> final RMSNorm
+    (or per-head block + RMSNorm with MTP) -> tied unembedding [B, T, V].
+    The input embedding and `lm_head` share one weight matrix, and a single
+    `RotaryEmbedding` is shared by every attention layer.
+
+    Optional features layered on top:
+    - MoE: each MoE block returns an unscaled load-balancing aux loss; the
+      mean over all MoE blocks that ran is added to the LM loss, scaled by
+      `router_loss_coef`.
+    - Draft vocab (`draft_vocab_size > 0`, MTP only): extra heads 1..n-1
+      predict over a reduced set of frequent tokens, which makes their
+      unembedding cheaper. Head 0 always uses the full vocab.
+    - Matryoshka nesting (`matryoshka_fracs`): smaller models are prefix
+      slices of this one's weights and can be run by passing a width
+      `frac` < 1, or extracted with `extract_matryoshka`.
+
+    Side effects for logging: training/eval forwards stash detached loss
+    values in `last_lm_loss`, `last_router_loss`, `last_mtp_losses` and
+    `last_losses_by_frac`, which `LLMTrainer` reads to log loss components.
     """
     config_class = ModelConfig
     base_model_prefix = "modern_transformer"
+    # Declared for the type checker: nn.Module.__getattr__ would otherwise
+    # type buffers and `config` as a generic Tensor | Module.
+    config: ModelConfig
+    draft_vocab: torch.Tensor
+    vocab_to_draft: torch.Tensor
+
     _tied_weights_keys = {"lm_head.weight": "tok_emb_table.weight"}  # noqa: RUF012
 
     def __init__(
             self,
             config: ModelConfig,
     ) -> None:
+        """Build the embedding, trunk, output head(s) and buffers.
+
+        With `n_future_tokens == 1` the layout is `layers` (L blocks) +
+        `rms_norm_f`, matching pre-MTP checkpoints. Otherwise it is
+        `layers` (L - 1 blocks) + `mtp_heads` (n blocks) + `mtp_norms`.
+        Raises on configurations the model cannot represent.
+        """
         super().__init__(config)
         self.n_future_tokens = config.n_future_tokens
         if self.n_future_tokens < 1:
@@ -74,18 +109,25 @@ class Model(PreTrainedModel, GenerationMixin):
                     raise ValueError("draft_vocab_size > vocab_size")
                 # Persistent so checkpoints carry their draft vocabulary.
                 # Placeholder until set_draft_vocab() is called (train.py).
+                # draft_vocab: [K] sorted token ids (draft index -> token id).
+                # vocab_to_draft: [V] token id -> draft index, or -100 (the
+                # cross-entropy ignore index) for tokens outside the draft.
                 self.register_buffer(
                     "draft_vocab", torch.arange(config.draft_vocab_size))
                 self.register_buffer(
                     "vocab_to_draft", torch.full((config.vocab_size,), -100))
                 self.vocab_to_draft[:config.draft_vocab_size] =\
                     torch.arange(config.draft_vocab_size)
+        # Unembedding. Its weight is tied to tok_emb_table (see
+        # _tied_weights_keys); the bias is its own parameter.
         self.lm_head = nn.Linear(config.embedding_size, config.vocab_size)
         self.block_size = config.block_size
 
         self.config.tie_word_embeddings = True
-        self.post_init()
+        self.post_init()  # HF hook: default init + lm_head weight tying
 
+        # Detached loss values of the last forward, read by the trainer for
+        # logging (they never take part in backprop).
         self.last_lm_loss = None
         self.last_router_loss = None
         self.last_mtp_losses = None
@@ -95,7 +137,14 @@ class Model(PreTrainedModel, GenerationMixin):
 
     @torch.no_grad()
     def set_draft_vocab(self, token_ids: torch.Tensor) -> None:
-        """Set the reduced vocabulary of the extra MTP heads (any order)."""
+        """Set the reduced vocabulary of the extra MTP heads (any order).
+
+        `token_ids` must hold exactly `draft_vocab_size` distinct ids. They
+        are stored sorted in `draft_vocab`, and `vocab_to_draft` is rebuilt
+        as the inverse map (-100 for tokens not in the draft vocab). train.py
+        calls this with the most frequent tokens of a counts file. Both are
+        buffers, so the result is saved with the checkpoint.
+        """
         token_ids = torch.as_tensor(token_ids).long().unique()  # sorted
         if token_ids.numel() != self.config.draft_vocab_size:
             raise ValueError(
@@ -110,18 +159,26 @@ class Model(PreTrainedModel, GenerationMixin):
             token_ids.numel(), device=token_ids.device)
 
     def _uses_draft_vocab(self, head_idx: int) -> bool:
+        """True if head `head_idx` predicts over the draft vocab (only extra
+        MTP heads, and only when a draft vocab is configured)."""
         return head_idx > 0 and self.config.draft_vocab_size > 0
 
     def _head_logits(self, head_idx: int, h: torch.Tensor) -> torch.Tensor:
         """Unembed one head. Extra heads with a draft vocab return logits
         over `draft_vocab` (indices into it, not token ids). A Matryoshka
         sub-width hidden state (d' = h.shape[-1]) uses the first d' columns
-        of the tied unembedding."""
+        of the tied unembedding.
+
+        `h` is [..., d']; the result is [..., V] (head 0, or no draft vocab)
+        or [..., K] (extra head with a draft vocab of size K).
+        """
         d = h.shape[-1]
         if not self._uses_draft_vocab(head_idx):
             if d == self.config.embedding_size:
                 return self.lm_head(h)
             return F.linear(h, self.lm_head.weight[:, :d], self.lm_head.bias)
+        # Gathering K rows of the [V, C] unembedding makes the projection
+        # K/V as expensive; gradients still flow into the shared weight.
         return F.linear(
             h,
             self.lm_head.weight[self.draft_vocab, :d],
@@ -130,6 +187,8 @@ class Model(PreTrainedModel, GenerationMixin):
 
     @staticmethod
     def _make_block(config: ModelConfig) -> Block:
+        """One transformer block (used for both trunk layers and MTP heads),
+        translating `ModelConfig` field names to `Block` arguments."""
         return Block(
             embedding_size=config.embedding_size,
             sa_head_size=config.sa_head_size,
@@ -147,6 +206,15 @@ class Model(PreTrainedModel, GenerationMixin):
         )
 
     def weight_init(self, module):
+        """Initialize one submodule; applied via `model.apply(...)` in train.py.
+
+        Linear layers get Xavier-normal weights and zero bias, except mHC
+        projections, which start near zero so stream mixing begins close to
+        a fixed pattern (the residual mixing bias starts at 0.1 * identity).
+        Embeddings use std 1/sqrt(C) and RMSNorm gains start at 1. Modules
+        not matched here (e.g. 3-D MoE expert weights) keep the init they
+        set themselves.
+        """
         if isinstance(module, nn.Linear):
             # mHC projections are tagged by MHCRouter. (This used to match any
             # Linear with 4 or 16 outputs, which also caught 4/16-expert
@@ -173,21 +241,32 @@ class Model(PreTrainedModel, GenerationMixin):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.tok_emb_table
 
-    def set_input_embeddings(self, value: nn.Embedding) -> None:
+    def set_input_embeddings(  # pyright: ignore[reportIncompatibleMethodOverride]
+            self, value: nn.Embedding) -> None:
         self.tok_emb_table = value
 
     def get_output_embeddings(self) -> nn.Linear:
         return self.lm_head
 
-    def set_output_embeddings(self, value: nn.Linear) -> None:
+    def set_output_embeddings(  # pyright: ignore[reportIncompatibleMethodOverride]
+            self, value: nn.Linear) -> None:
         self.lm_head = value
 
-    def prepare_inputs_for_generation(
+    # HF's signature has more optional parameters; `generate` passes them all
+    # by keyword, and they land in **kwargs here.
+    def prepare_inputs_for_generation(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
         input_ids: torch.Tensor,
         past_key_values: Cache | None = None,
         **kwargs
     ):
+        """HF `generate` hook: pick the model inputs for the next step.
+
+        Once the KV cache holds earlier tokens only the newest token has to
+        be fed in (its K/V for past positions are already cached). On the
+        first step the prompt is cropped to the last `block_size` tokens,
+        the longest context the model was trained on.
+        """
         past_length = 0
 
         if past_key_values is not None:
@@ -209,10 +288,17 @@ class Model(PreTrainedModel, GenerationMixin):
     # ------------------------------------------------------------------ #
 
     def _embed(self, input_ids: torch.Tensor, frac: float) -> torch.Tensor:
+        """Token ids [B, T] -> residual stream [B, T, C'] (C' = frac * C).
+
+        No positional embedding is added here: position enters only through
+        RoPE inside attention. With mHC the stream is copied into
+        `num_residual_streams` parallel streams, giving [B, T, S, C].
+        """
         x = self.tok_emb_table(input_ids)
         if frac < 1.0:  # Matryoshka: residual stream = first d' dims
             x = x[..., :round(self.config.embedding_size * frac)]
         x = self.emb_drop(x)
+        # Match the parameter dtype (e.g. bf16) when running without autocast.
         x = x.to(next(self.parameters()).dtype)
         if self.config.num_residual_streams > 1:
             x = x.unsqueeze(2).repeat(
@@ -220,6 +306,8 @@ class Model(PreTrainedModel, GenerationMixin):
         return x
 
     def _collapse_streams(self, x: torch.Tensor) -> torch.Tensor:
+        """mHC: average the S residual streams, [B, T, S, C] -> [B, T, C].
+        A no-op with a single stream."""
         return x.mean(dim=2) if self.config.num_residual_streams > 1 else x
 
     def _run_trunk(
@@ -229,6 +317,17 @@ class Model(PreTrainedModel, GenerationMixin):
         past_length: int,
         frac: float,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Run the trunk blocks in order.
+
+        Returns the trunk output (same shape as `x`) and the list of MoE aux
+        losses of the blocks that produced one (empty for a dense model).
+        Block `i` uses KV-cache layer `i`; `past_length` is the number of
+        cached tokens, used as the RoPE position offset.
+
+        With `block_checkpoint`, each block is recomputed in backward instead
+        of storing its activations (less memory, about one extra forward).
+        This is only done in training with grad enabled and no KV cache.
+        """
         aux_losses = []
         recompute = getattr(self.config, "block_checkpoint", False)\
             and self.training and torch.is_grad_enabled()\
@@ -260,7 +359,13 @@ class Model(PreTrainedModel, GenerationMixin):
         past_length: int,
         frac: float,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Trunk output -> normalized hidden state [B, T, C] for one head."""
+        """Trunk output -> normalized hidden state [B, T, C] for one head.
+
+        Without MTP this is just the final RMSNorm. With MTP, head
+        `head_idx` is its own block followed by its own RMSNorm; it uses
+        KV-cache layer `len(layers) + head_idx`, after the trunk's layers.
+        Also returns the head block's MoE aux loss (None if dense or no MTP).
+        """
         if self.n_future_tokens == 1:
             return prefix_rms_norm(
                 self.rms_norm_f, self._collapse_streams(x)), None
@@ -272,8 +377,8 @@ class Model(PreTrainedModel, GenerationMixin):
             layer_idx=len(self.layers) + head_idx,
             frac=frac,
         )
-        return prefix_rms_norm(
-            self.mtp_norms[head_idx], self._collapse_streams(y)), router_loss
+        norm = cast(nn.RMSNorm, self.mtp_norms[head_idx])
+        return prefix_rms_norm(norm, self._collapse_streams(y)), router_loss
 
     def _head_loss(
         self,
@@ -291,6 +396,10 @@ class Model(PreTrainedModel, GenerationMixin):
         (flattened B*T indices) and, for extra heads, to the draft vocab.
         Targets outside the draft vocab are ignored. Runs under activation
         checkpointing when `mtp_checkpoint` is set.
+
+        `targets` is [B, T] token ids for this head (already shifted by the
+        caller), with -100 where there is nothing to predict. The CE is
+        summed, not averaged, so the caller can choose the normalization.
         """
         h, router_loss = self._run_head(head_idx, x, None, 0, frac)
         h = h.reshape(-1, h.shape[-1])
@@ -298,6 +407,9 @@ class Model(PreTrainedModel, GenerationMixin):
         if positions is not None:
             h, targets = h[positions], targets[positions]
         if self._uses_draft_vocab(head_idx):
+            # Token ids -> draft indices. clamp_min(0) only makes the -100
+            # padding a valid index for the lookup; those entries are put
+            # back to -100 below. Out-of-draft tokens map to -100 as well.
             mapped = self.vocab_to_draft[targets.clamp_min(0)]
             targets = torch.where(targets == -100, -100, mapped)
         ce = F.cross_entropy(  # fp32 loss even without autocast
@@ -307,6 +419,8 @@ class Model(PreTrainedModel, GenerationMixin):
             reduction="sum",
         )
         if router_loss is None:
+            # A tensor, not None, so the return value can pass through
+            # torch.utils.checkpoint.
             router_loss = torch.zeros((), device=ce.device, dtype=ce.dtype)
         return ce, router_loss, (targets != -100).sum()
 
@@ -318,13 +432,28 @@ class Model(PreTrainedModel, GenerationMixin):
         num_items_in_batch: int | None,
         frac: float,
     ) -> torch.Tensor:
+        """Training loss with every MTP head, from trunk output `x`.
+
+        loss = lm_loss + mtp_loss_weight * mean(extra head losses)
+               + router_loss_coef * mean(MoE aux losses of trunk and heads).
+
+        Each head's loss runs under activation checkpointing when
+        `mtp_checkpoint` is set, so the backward pass recomputes that head
+        and only one head's [B, T, V] logits are alive at a time. Logits
+        are never returned (the trainer only needs the loss).
+
+        Side effects: sets `last_mtp_losses` ([n] per-head per-token means),
+        `last_lm_loss` (head 0's) and `last_router_loss` for logging.
+        """
         B, T = labels.shape
         n_valid_0 = (labels != -100).sum().clamp_min(1)
         pos_frac = self.config.mtp_position_frac
         n_sampled = max(1, round(pos_frac * B * T))
         head_losses, logged_losses = [], []
         for i in range(self.n_future_tokens):
-            # labels[:, t] is token t+1; head i predicts token t+1+i.
+            # labels[:, t] is token t+1; head i predicts token t+1+i, so its
+            # targets are labels shifted left by i, padded with -100 at the
+            # end where the target lies past this window.
             targets = labels if i == 0 else torch.cat(
                 [labels[:, i:], labels.new_full((B, i), -100)], dim=1)
             # Extra heads: fixed-size random subset of positions (fixed size
@@ -352,6 +481,8 @@ class Model(PreTrainedModel, GenerationMixin):
                 aux_losses.append(router_loss)
 
         head_losses = torch.stack(head_losses)
+        # Head 0 is the ordinary next-token loss and keeps weight 1; the
+        # extra heads act as an auxiliary objective.
         lm_loss = head_losses[0]
         loss = lm_loss + self.config.mtp_loss_weight * head_losses[1:].mean()
         aux_loss = torch.stack(aux_losses).mean() if aux_losses else None
@@ -393,6 +524,21 @@ class Model(PreTrainedModel, GenerationMixin):
         width; a KV cache is only valid for the width it was built with.
         With `train_fracs` set, a training forward with labels runs every
         width in it on the same batch and returns the sum of their losses.
+
+        Args:
+            input_ids: [B, T] token ids.
+            attention_mask: [B, T], 0 marks padding; those labels are ignored.
+            labels: [B, T] targets already shifted by one (labels[:, t] is
+                token t+1), -100 = ignore. The shift is done by the dataset,
+                not here.
+            num_items_in_batch: number of target tokens over all gradient
+                accumulation micro-batches (passed by HF Trainer). When
+                given, the summed CE is divided by it, so the accumulated
+                gradient is a true per-token mean.
+            past_key_values / use_cache: HF KV cache (stores MLA latents).
+            return_per_sample_loss: return a [B] loss (mean over each
+                sequence's tokens) instead of a scalar; used by HellaSwag to
+                score candidate endings.
         """
         if (
             len(self.train_fracs) > 1
@@ -421,7 +567,14 @@ class Model(PreTrainedModel, GenerationMixin):
     ) -> CausalLMOutputWithPast:
         """forward() at width `frac`. Not `self.forward`: Accelerate wraps
         that in autocast, and re-entering the wrapper per size inside one
-        compiled graph breaks dynamo."""
+        compiled graph breaks dynamo.
+
+        A training forward with labels and MTP goes to `_mtp_training_loss`
+        and returns only a loss. Otherwise head 0 alone is run and the
+        result carries logits [B, T, V], the loss (if labels are given) and
+        the cache. Sets `last_lm_loss` / `last_router_loss` when labels are
+        given.
+        """
         use_cache = use_cache if use_cache is not None\
             else getattr(self.config, "use_cache", True)
         cache = past_key_values if use_cache else None
@@ -432,6 +585,7 @@ class Model(PreTrainedModel, GenerationMixin):
             labels = labels.masked_fill(attention_mask == 0, -100)
 
         x = self._embed(input_ids, frac)
+        # Number of already-cached tokens = position of the first new token.
         past_length = past_key_values.get_seq_length()\
             if past_key_values is not None else 0
         x, aux_losses = self._run_trunk(x, cache, past_length, frac)
@@ -449,14 +603,17 @@ class Model(PreTrainedModel, GenerationMixin):
         h, router_loss = self._run_head(0, x, cache, past_length, frac)
         if router_loss is not None:
             aux_losses.append(router_loss)
+        # Mean (not sum) over MoE blocks, so router_loss_coef does not depend
+        # on depth. MoE returns each block's aux loss unscaled.
         aux_loss = torch.stack(aux_losses).mean() if aux_losses else None
         logits = self._head_logits(0, h)
 
         if labels is None:
             loss = None
         else:
-            B, T, C = logits.shape
+            B, T, C = logits.shape  # C here is the vocab size V
 
+            # Upcast to fp32: softmax over ~49k classes in bf16 is lossy.
             lm_loss = per_token = F.cross_entropy(
                 logits.view(-1, C).float(),
                 labels.view(-1),
@@ -468,6 +625,9 @@ class Model(PreTrainedModel, GenerationMixin):
                 lm_loss = lm_loss.view(B, T)
                 loss = lm_loss.sum(dim=1) / (labels != -100).sum(dim=1).clamp_min(1)
             elif num_items_in_batch is not None:
+                # Divide by the token count of the whole accumulated batch
+                # (not this micro-batch) so micro-batches with more padding
+                # are not over-weighted.
                 loss = lm_loss = lm_loss.sum() / num_items_in_batch
                 if aux_loss is not None:
                     loss = lm_loss + self.config.router_loss_coef * aux_loss
@@ -483,7 +643,7 @@ class Model(PreTrainedModel, GenerationMixin):
                 if aux_loss is not None else None
 
         return CausalLMOutputWithPast(
-            logits=logits,
+            logits=logits, # type: ignore
             loss=loss, # type: ignore
             past_key_values=past_key_values if use_cache else None, # type: ignore
         )
@@ -500,12 +660,19 @@ class Model(PreTrainedModel, GenerationMixin):
         Each width keeps weight 1, so the full model's gradient is the same
         as in a run without Matryoshka, plus the smaller widths' gradients.
         The logged `last_*` values are the full model's afterwards.
+
+        Side effect: `last_losses_by_frac` maps each width to its
+        (lm loss, MTP head losses | None) for per-size logging. No cache is
+        used, and no logits are returned.
         """
         total, by_frac, full = None, {}, None
         for frac in self.train_fracs:
-            loss = self._forward(
+            # Each _forward overwrites the last_* attributes, so they are
+            # copied out after every width.
+            # Always set: a training forward with labels returns a loss.
+            loss = cast(torch.Tensor, self._forward(
                 input_ids, attention_mask, labels, num_items_in_batch,
-                None, False, False, frac).loss
+                None, False, False, frac).loss)
             total = loss if total is None else total + loss
             mtp = self.last_mtp_losses if self.n_future_tokens > 1 else None
             by_frac[frac] = (self.last_lm_loss, mtp)
@@ -531,6 +698,9 @@ class Model(PreTrainedModel, GenerationMixin):
         `predict_all_heads` for token ids). Every head writes its own
         KV-cache layer, so all heads must be run on every position for the
         cache to stay consistent (used by speculative decoding).
+
+        Runs at width `self.active_frac`. Heads 1..n-1 propose draft tokens
+        that head 0 later verifies (see `utils/spec_decode.py`).
         """
         frac = self.active_frac
         x = self._embed(input_ids, frac)
@@ -549,11 +719,17 @@ class Model(PreTrainedModel, GenerationMixin):
         input_ids: torch.Tensor,
         past_key_values: Cache | None = None,
     ) -> torch.Tensor:
-        """Greedy token ids of every head, shape [n_future_tokens, B, T]."""
+        """Greedy token ids of every head, shape [n_future_tokens, B, T].
+
+        Like `forward_all_heads` (and with the same cache side effects), but
+        maps draft-vocab indices back to token ids, so every row is
+        comparable. `preds[i][:, t]` is the guess for token t+1+i.
+        """
         preds = []
         for i, logits in enumerate(
                 self.forward_all_heads(input_ids, past_key_values)):
             ids = logits.argmax(-1)
+            # draft_vocab is the draft index -> token id table.
             preds.append(self.draft_vocab[ids]
                          if self._uses_draft_vocab(i) else ids)
         return torch.stack(preds)
@@ -566,6 +742,12 @@ class Model(PreTrainedModel, GenerationMixin):
         kv_down = [latent | rope] and MoE gate_up = [gate | up], are sliced
         per part and re-concatenated). Raises on any parameter it does not
         know how to slice, so new modules can't be silently mis-extracted.
+
+        The returned model has a plain config at the smaller sizes, with
+        `ff_hidden_exact=True` (the sliced FFN width is used as is, without
+        the SwiGLU 2/3-and-round rule) and `matryoshka_fracs = [1.0]`. It
+        lives on this model's device and dtype and copies its generation
+        config, so it can be saved and loaded like any other checkpoint.
         """
         if frac not in self.config.matryoshka_fracs:
             raise ValueError(f"{frac} is not one of the trained sizes "
@@ -587,18 +769,30 @@ class Model(PreTrainedModel, GenerationMixin):
         config.matryoshka_fracs = [1.0]
 
         def slice_param(name: str, w: torch.Tensor) -> torch.Tensor:
+            """Prefix slice of state-dict entry `name` for width `frac`.
+
+            Linear weights are [out, in], so rows are output features and
+            columns input features. Attention projections are head-major,
+            so keeping the first `n_heads * head_dim` rows keeps whole
+            heads. 3-D MoE weights are [E, out, in]; all experts are kept.
+            """
             last = name.split(".")[-2:]
             if name in ("tok_emb_table.weight", "lm_head.weight") or\
                     name.endswith("router.weight"):
                 return w[:, :d]
+            # Not nested: vocab-sized, RoPE-sized (head dim is fixed), or
+            # buffers that do not depend on width.
             if name in ("lm_head.bias", "rotary_emb.freqs",
                         "draft_vocab", "vocab_to_draft") or last[-1] == "mask":
                 return w
             if last == ["q_proj", "weight"]:
                 return w[:n_heads * head_dim, :d]
             if last == ["kv_down", "weight"]:
+                # Rows are [latent | rope]: keep the first `latent` latent
+                # rows and all rope rows.
                 return torch.cat([w[:latent], w[latent_full:]])[:, :d]
             if last == ["k_up", "weight"]:
+                # k_up makes only the non-RoPE part of each head's key.
                 return w[:n_heads * nope_dim, :latent]
             if last == ["v_up", "weight"]:
                 return w[:n_heads * head_dim, :latent]
@@ -609,6 +803,7 @@ class Model(PreTrainedModel, GenerationMixin):
             if last == ["down_proj", "weight"]:
                 return w[:d, :hidden]
             if last[-1] == "gate_up_weight":
+                # [E, gate H | up H, C]: take the first `hidden` of each half.
                 return torch.cat(
                     [w[:, :hidden], w[:, hidden_full:hidden_full + hidden]],
                     dim=1)[..., :d]
@@ -621,7 +816,12 @@ class Model(PreTrainedModel, GenerationMixin):
             raise NotImplementedError(f"don't know how to slice {name}")
 
         param = next(self.parameters())
-        small = Model(config).to(device=param.device, dtype=param.dtype)
+        # strict=True: the sliced state dict must match the smaller model's
+        # parameter and buffer names and shapes exactly.
+        # (HF wraps `to` with functools.wraps, which hides its signature from
+        # the type checker.)
+        small = Model(config).to(  # pyright: ignore[reportCallIssue]
+            device=param.device, dtype=param.dtype)
         small.generation_config = copy.deepcopy(self.generation_config)
         state = {name: slice_param(name, w).clone()
                  for name, w in self.state_dict().items()}
