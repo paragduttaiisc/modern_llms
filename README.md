@@ -208,7 +208,8 @@ model/
 utils/
 ├── train_utils.py          LLMTrainer: optimizer groups, LR schedule, eval, logging
 ├── data_utils.py           Sharded token dataset, HellaSwag dataset
-├── spec_decode.py          Greedy and MTP self-speculative decoding
+├── spec_decode.py          Greedy and MTP speculative decoding (self or nested draft)
+├── fast_decode.py          The same decoders with a static cache and CUDA graphs
 └── misc_utils.py           Helpers
 scripts/
 ├── token_frequencies.py    Token counts for the MTP draft vocabulary
@@ -312,6 +313,7 @@ Every size must give whole-number dimensions (768·f, 12·f heads, 128·f latent
 | `--n-heads` | 12 | Attention heads |
 | `--attn-head-size` | 64 | Per-head dimension |
 | `--rope-size` | 16 | RoPE part of each head |
+| `--legacy-rope-positions` | off | Compute RoPE positions in the activations' dtype, as runs before the fp32 fix did (in bf16 this rounds positions above 256) |
 | `--kv-latent-size` | 128 | MLA latent size |
 | `--mlp-hidden-size` | 3072 | FFN width (SwiGLU uses 2/3 of it, rounded up to a multiple of 256) |
 | `--non-linearity` | SwiGLU | `SwiGLU`, `GELU` or `SqReLU` |
@@ -397,6 +399,8 @@ python infer.py --save-dir=outputs/checkpoint-xxx --prompt "Hello" --use-cache \
 # (reports tokens per forward pass, draft acceptance and speedup)
 python infer.py --save-dir=outputs/checkpoint-xxx --prompt "Hello" --speculative --max-new-tokens=256
 ```
+
+Add `--cuda-graphs` to `--speculative` to decode with a static KV cache and CUDA graphs (`utils/fast_decode.py`). At batch size 1 most of the time otherwise goes to launching kernels from Python. On an A100 with a 124M MTP4 checkpoint, greedy decoding went from 64 to 394 tok/s, and self-speculative decoding reached 534 tok/s, with the same output as eager decoding (exact in fp32). It supports dense models; MoE layers can't be captured on GPUs where `grouped_mm` syncs with the CPU, such as A100 and RTX 30xx.
 
 Add `--matryoshka-frac=0.25` to run a smaller nested size of a Matryoshka checkpoint (this also works with `--speculative`). For a checkpoint trained with `--mtp-nested-only`, `--speculative --draft-frac=0.25` drafts with the quarter-width model's MTP heads and verifies with the full model, so the output still equals the full model's greedy decoding.
 

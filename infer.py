@@ -37,6 +37,7 @@ from transformers import (
 
 from model import Model, ModelConfig
 from utils import get_tokenizer
+from utils.fast_decode import graph_greedy_decode, graph_speculative_decode
 from utils.spec_decode import greedy_decode, speculative_decode
 
 
@@ -66,9 +67,15 @@ def run_speculative(model, tokenizer, args: argparse.Namespace,
     input_ids = torch.tensor(
         [tokenizer.encode(args.prompt)], device=args.device)
     eos = None if args.ignore_eos else tokenizer.eos_token_id
-    run_greedy = lambda: greedy_decode(  # noqa: E731
+    # --cuda-graphs: the same decoders with a static cache and captured
+    # steps (utils/fast_decode.py), which removes the per-kernel launch
+    # overhead that dominates batch-1 decoding.
+    greedy_fn = graph_greedy_decode if args.cuda_graphs else greedy_decode
+    spec_fn = graph_speculative_decode if args.cuda_graphs\
+        else speculative_decode
+    run_greedy = lambda: greedy_fn(  # noqa: E731
         model, input_ids, args.max_new_tokens, eos)
-    run_spec = lambda: speculative_decode(  # noqa: E731
+    run_spec = lambda: spec_fn(  # noqa: E731
         model, input_ids, args.max_new_tokens, eos, draft_model=draft)
     # Warm-up: the first calls pay for CUDA context setup, kernel selection
     # and allocator growth, which would distort the timings below.
@@ -214,6 +221,7 @@ if __name__ == "__main__":
     parser.add_argument("--ignore-eos", action="store_true", help="Keep generating past EOS (for fixed-length benchmarks)")
     parser.add_argument("--matryoshka-frac", type=float, default=1.0, help="Run a smaller nested size (extracted from a Matryoshka checkpoint)")
     parser.add_argument("--draft-frac", type=float, default=0.0, help="With --speculative: draft with this nested Matryoshka size's MTP heads and verify with the full model (0 = self-speculation)")
+    parser.add_argument("--cuda-graphs", action="store_true", help="With --speculative: decode with a static cache and CUDA graphs (dense models; much less launch overhead)")
     args = parser.parse_args()
     set_seed(args.seed)
     main(args)

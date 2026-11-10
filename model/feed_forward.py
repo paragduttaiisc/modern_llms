@@ -173,6 +173,19 @@ class MoE(nn.Module):
             self.up_weight.normal_(mean=0.0, std=up_std)
         self.down_weight.normal_(mean=0.0, std=down_std)
 
+    def _count_per_expert(self, expert_indices: torch.Tensor) -> torch.Tensor:
+        """Number of routed slots per expert [E] (int64).
+
+        Same result as `torch.bincount(..., minlength=E)`, but bincount on
+        CUDA reads the maximum index back to the CPU to size its output,
+        which breaks CUDA-graph capture (utils/fast_decode.py) and forces a
+        sync every forward pass. A fixed-size scatter-add needs neither.
+        """
+        counts = torch.zeros(
+            self.num_experts, dtype=torch.long, device=expert_indices.device)
+        return counts.scatter_add_(
+            0, expert_indices, torch.ones_like(expert_indices))
+
     @staticmethod
     def _grouped_mm(
         x: torch.Tensor,
@@ -241,8 +254,7 @@ class MoE(nn.Module):
         importance = router_probs.mean(dim=0)
         flat_expert_indices = topk_indices.reshape(-1)
 
-        num_tokens_per_expert = torch.bincount(
-            flat_expert_indices, minlength=self.num_experts)
+        num_tokens_per_expert = self._count_per_expert(flat_expert_indices)
         load = num_tokens_per_expert.float() / float(N * self.top_k)
 
         # Unscaled Switch-style balance loss (== 1.0 when perfectly balanced);
@@ -267,8 +279,7 @@ class MoE(nn.Module):
         sorted_routing_weights = routing_weights[sort_order]
         x_sorted = x_flat[sorted_token_indices]
 
-        tokens_per_expert =\
-            torch.bincount(flat_expert_indices, minlength=self.num_experts)
+        tokens_per_expert = num_tokens_per_expert
         # End row of each expert's run in the sorted order
         offsets = torch.cumsum(tokens_per_expert, dim=0, dtype=torch.int32)
 

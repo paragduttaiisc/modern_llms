@@ -1,9 +1,31 @@
 
+from typing import cast
+
 import torch
 import torch.nn.functional as F
-from rotary_embedding_torch import RotaryEmbedding
+from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
+from rotary_embedding_torch.rotary_embedding_torch import rotate_half
 from torch import nn
 from transformers.cache_utils import Cache
+
+
+def rope_fp32(
+        rotary_emb: RotaryEmbedding, t: torch.Tensor,
+        positions: torch.Tensor) -> torch.Tensor:
+    """Rotate `t` [..., T, rope_dim] for `positions` [T], in fp32.
+
+    The same rotation as `rotate_queries_or_keys`, except that positions,
+    angles and the rotation are all computed in fp32. The library builds
+    positions in the input's dtype, so with bf16 activations positions
+    above 256 get rounded (only 641 distinct values among 0..2047). The
+    stored frequencies are used as they are (bf16 after the model cast),
+    which only shifts each frequency slightly and keeps relative positions
+    exact. Returns `t`'s dtype.
+    """
+    angles = positions.float()[:, None] * rotary_emb.freqs.float()[None, :]
+    angles = angles.repeat_interleave(2, dim=-1)  # [T, rope_dim], pairs
+    x = t.float()
+    return (x * angles.cos() + rotate_half(x) * angles.sin()).to(t.dtype)
 
 
 class MultiHeadedLatentAttention(nn.Module):
@@ -137,8 +159,33 @@ class MultiHeadedLatentAttention(nn.Module):
 
         # Rotate only the rope slices; the offset gives cached decoding the
         # absolute positions of the new tokens.
-        q_rope = rotary_emb.rotate_queries_or_keys(q_rope, offset=past_length)
-        k_rope = rotary_emb.rotate_queries_or_keys(k_rope, offset=past_length)
+        # [T] absolute positions of the new tokens, static cache only
+        positions: torch.Tensor | None = None
+        # Set by Model from config.rope_fp32_positions (False for models
+        # trained before the fix, so they keep the rotation they learned).
+        fp32 = getattr(rotary_emb, "fp32_positions", False)
+        if getattr(past_key_values, "is_static", False):
+            # Static cache (CUDA-graph decoding, utils/fast_decode.py): the
+            # positions live in a device tensor, so the offset can't be a
+            # Python int.
+            positions = cast(torch.Tensor, past_key_values.positions(T))  # pyright: ignore[reportAttributeAccessIssue, reportOptionalMemberAccess]
+            assert self.flash, "the static cache needs F.scaled_dot_product_attention"
+        if fp32:
+            pos = positions if positions is not None else past_length\
+                + torch.arange(T, device=q_rope.device)
+            q_rope = rope_fp32(rotary_emb, q_rope, pos)
+            k_rope = rope_fp32(rotary_emb, k_rope, pos)
+        elif positions is not None:
+            # Reproduces rotate_queries_or_keys exactly, including its
+            # positions in the query dtype.
+            freqs = rotary_emb.forward(positions.to(q_rope.dtype))
+            q_rope = apply_rotary_emb(freqs, q_rope)
+            k_rope = apply_rotary_emb(freqs, k_rope)
+        else:
+            q_rope = rotary_emb.rotate_queries_or_keys(
+                q_rope, offset=past_length)
+            k_rope = rotary_emb.rotate_queries_or_keys(
+                k_rope, offset=past_length)
 
         # The cache stores the latent c and the already-rotated k_rope (not
         # full per-head K/V); update() appends the new tokens and returns
@@ -170,7 +217,13 @@ class MultiHeadedLatentAttention(nn.Module):
             # draft tokens) the mask must be aligned bottom-right instead.
             # A single new token (T == 1) may see the whole cache: no mask.
             attn_mask, is_causal = None, (T > 1)
-            if T > 1 and T_k > T:
+            if positions is not None:
+                # The static cache spans its whole capacity; each new token
+                # may see the keys up to and including its own position.
+                attn_mask = torch.arange(T_k, device=q.device)[None, :]\
+                    <= positions[:, None]
+                is_causal = False
+            elif T > 1 and T_k > T:
                 attn_mask = torch.ones(
                     T, T_k, dtype=torch.bool, device=q.device,
                 ).tril(diagonal=T_k - T)

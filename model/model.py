@@ -104,6 +104,9 @@ class Model(PreTrainedModel, GenerationMixin):
             config.vocab_size, config.embedding_size)
         self.emb_drop = nn.Dropout(config.dropout)
         self.rotary_emb = RotaryEmbedding(dim=config.rope_size)
+        # Read by every attention layer (see attention.rope_fp32)
+        self.rotary_emb.fp32_positions = getattr(  # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
+            config, "rope_fp32_positions", False)
 
         n_trunk = config.num_hidden_layers if self.n_future_tokens == 1\
             else config.num_hidden_layers - 1
