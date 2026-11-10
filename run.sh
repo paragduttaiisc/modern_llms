@@ -31,5 +31,4 @@ accelerate launch \
     --last-decay-iter=13725 \
     --n-iters=15250 \
     --save-dir="outputs" \
-    --wandb-run-name="GPT2-MLA" \
-    --use-bf16
+    --wandb-run-name="GPT2-MLA"
