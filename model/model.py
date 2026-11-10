@@ -420,7 +420,9 @@ class Model(PreTrainedModel, GenerationMixin):
         cache = past_key_values if use_cache else None
 
         if labels is not None and attention_mask is not None:
-            labels[attention_mask == 0] = -100
+            # Out of place: with train_fracs the same labels tensor is
+            # reused by every size, and autograd has saved it already.
+            labels = labels.masked_fill(attention_mask == 0, -100)
 
         x = self._embed(input_ids, frac)
         past_length = past_key_values.get_seq_length()\
