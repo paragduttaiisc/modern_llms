@@ -33,6 +33,37 @@ from .data_utils import HellaswagDataset, hellaswag_collate_fn
 from .misc_utils import human_readable_numbers as hrn
 
 
+class CPUStateLambdaLR(LambdaLR):
+    """`LambdaLR` whose saved state holds no CUDA tensors.
+
+    muonium keeps each Muon group's `lr` as a tensor on the GPU, so the
+    scheduler's `base_lrs` / `_last_lr` would be saved on `cuda:0`. HF loads
+    `scheduler.pt` with a plain `torch.load` on every rank, so each rank
+    then created a CUDA context (~420 MB) on GPU 0, and resuming the 100B
+    config ran out of memory there. The state is saved on the CPU instead,
+    and loading moves the values back to each group's `lr` device.
+    """
+
+    def state_dict(self) -> dict[str, Any]:
+        state = super().state_dict()
+        for key in ("base_lrs", "_last_lr"):
+            if key in state:
+                state[key] = [v.detach().cpu() if torch.is_tensor(v) else v
+                              for v in state[key]]
+        return state
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        super().load_state_dict(state_dict)
+        for key in ("base_lrs", "_last_lr"):
+            values = getattr(self, key, None)
+            if values is None:
+                continue
+            setattr(self, key, [
+                v.to(g["lr"].device) if torch.is_tensor(v)
+                and torch.is_tensor(g["lr"]) else v
+                for v, g in zip(values, self.optimizer.param_groups)])
+
+
 class MuonFP32State(Muon):
     """Muon whose AdamW groups keep their moments in fp32.
 
@@ -78,8 +109,15 @@ class MuonFP32State(Muon):
 
         Gathers the params that have a gradient, lazily creates fp32
         `exp_avg` / `exp_avg_sq` state, runs `torch.optim.adam`'s functional
-        foreach kernel on fp32 copies of weights and gradients, and copies
-        the updated fp32 weights back into the (bf16) parameters in place.
+        foreach kernel on fp32 master weights and fp32 gradients, and copies
+        the updated master weights back into the (bf16) parameters in place.
+
+        The fp32 master copy (`state["master"]`) persists across steps. It
+        used to be rebuilt from the bf16 weight every step, so any update
+        below half a bf16 step was rounded away: RMSNorm gains (1.0, whose
+        bf16 neighbours are 0.0039 / 0.0078 away) never moved from 1 with
+        an AdamW lr of 1e-3. The AdamW params are small (norms, embedding,
+        lm_head bias), so this costs ~4 bytes per embedding weight.
         """
         params, params32, grads32, exp_avgs, exp_avg_sqs, steps =\
             [], [], [], [], [], []
@@ -98,8 +136,15 @@ class MuonFP32State(Muon):
             # the non-capturable `adam` path expects CPU step tensors.
             if state["step"].device.type != "cpu":
                 state["step"] = state["step"].cpu()
+            if p.dtype != torch.float32:
+                # Older checkpoints have no master copy: start from p.
+                if "master" not in state:
+                    state["master"] = p.detach().float().clone()
+                master = state["master"]
+            else:
+                master = p.detach()  # updated in place, no copy needed
             params.append(p)
-            params32.append(p.detach().float())
+            params32.append(master)
             grads32.append(p.grad.float())
             exp_avgs.append(state["exp_avg"])
             exp_avg_sqs.append(state["exp_avg_sq"])
@@ -120,7 +165,8 @@ class MuonFP32State(Muon):
         )
         with torch.no_grad():  # (DTensor has no _foreach_copy_)
             for p, p32 in zip(params, params32):
-                p.copy_(p32)
+                if p.dtype != torch.float32:
+                    p.copy_(p32)
 
 
 class LLMTrainer(Trainer):
@@ -419,7 +465,7 @@ class LLMTrainer(Trainer):
                 return (lo / base) * (hi / lo) ** (min(step, steps) / steps)
 
             assert optimizer is not None
-            self.lr_scheduler = LambdaLR(optimizer, lr_lambda=[
+            self.lr_scheduler = CPUStateLambdaLR(optimizer, lr_lambda=[
                 muon_range if group.get("use_muon") else (lambda step: 1.0)
                 for group in optimizer.param_groups])
             return self.lr_scheduler
@@ -441,7 +487,7 @@ class LLMTrainer(Trainer):
                 return 0.1 + 0.9 * cosine
             return 0.1
 
-        self.lr_scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
+        self.lr_scheduler = CPUStateLambdaLR(optimizer, lr_lambda=lr_lambda)
 
         return self.lr_scheduler
 

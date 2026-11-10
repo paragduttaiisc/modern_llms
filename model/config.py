@@ -48,13 +48,13 @@ class ModelConfig(PreTrainedConfig):
         n_future_tokens, mtp_loss_weight, mtp_checkpoint, block_checkpoint,
         draft_vocab_size, mtp_position_frac, matryoshka_fracs,
         mtp_nested_only, kd_weight, kd_position_frac, rope_fp32_positions,
-        ff_hidden_exact: see the comments in `__init__`. CLI flags:
+        qk_norm, ff_hidden_exact: see the comments in `__init__`. CLI flags:
             --n-future-tokens, --mtp-loss-weight, --no-mtp-checkpoint
             (inverted), --activation-checkpointing, --draft-vocab-size,
             --mtp-position-frac, --matryoshka-fracs (comma-separated),
             --mtp-nested-only, --matryoshka-kd-weight,
             --matryoshka-kd-position-frac, --legacy-rope-positions
-            (inverted); `ff_hidden_exact` has no flag.
+            (inverted), --no-qk-norm (inverted); `ff_hidden_exact` has no flag.
     """
     model_type = "modern_transformer"
 
@@ -86,6 +86,7 @@ class ModelConfig(PreTrainedConfig):
             kd_weight: float = 0.0,
             kd_position_frac: float = 0.25,
             rope_fp32_positions: bool = False,
+            qk_norm: bool = False,
             ff_hidden_exact: bool = False,
             **kwargs
     ) -> None:
@@ -112,6 +113,12 @@ class ModelConfig(PreTrainedConfig):
         # (whose config has no such key) keep the rotation they were trained
         # with; train.py turns it on for new runs.
         self.rope_fp32_positions = rope_fp32_positions
+        # RMSNorm each attention head's query and key (whole head, nope and
+        # rope parts together, after RoPE) right before attention. Bounds
+        # the attention logits, which otherwise grow until every head
+        # attends to one token (seen at d1536/L24 with Muon). Defaults to
+        # False so older checkpoints load unchanged; train.py turns it on.
+        self.qk_norm = qk_norm
         # Use ff_hidden_size as the exact FFN width (no SwiGLU 2/3 + round);
         # set by Matryoshka extraction.
         self.ff_hidden_exact = ff_hidden_exact

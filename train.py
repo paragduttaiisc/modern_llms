@@ -163,6 +163,7 @@ def main(args: argparse.Namespace):
         kd_weight=args.matryoshka_kd_weight,
         kd_position_frac=args.matryoshka_kd_position_frac,
         rope_fp32_positions=not args.legacy_rope_positions,
+        qk_norm=not args.no_qk_norm,
     ))
     if model.config.draft_vocab_size > 0:
         # Draft vocab of the extra MTP heads = most frequent training tokens.
@@ -282,6 +283,7 @@ if __name__ == "__main__":
     parser.add_argument("--n-heads", type=int, default=12)
     parser.add_argument("--attn-head-size", type=int, default=64)
     parser.add_argument("--rope-size", type=int, default=16)
+    parser.add_argument("--no-qk-norm", action="store_true", help="Leave out the per-head query/key RMSNorm (QK-norm), as runs before it was added did")
     parser.add_argument("--legacy-rope-positions", action="store_true", help="Compute RoPE positions in the activations' dtype, as runs before the fp32 fix did (bf16 rounds positions above 256)")
     parser.add_argument("--embed-size", type=int, default=768)
     parser.add_argument("--mlp-hidden-size", type=int, default=3072)

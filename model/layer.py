@@ -83,6 +83,7 @@ class Block(nn.Module):
             activation: str,
             dropout: float,
             exact_ffn_hidden: bool = False,
+            qk_norm: bool = False,
     ) -> None:
         super().__init__()
 
@@ -94,6 +95,7 @@ class Block(nn.Module):
             kv_latent_dim=kv_latent_size,
             block_size=block_size,
             dropout=dropout,
+            qk_norm=qk_norm,
         )
 
         if n_experts == 1:

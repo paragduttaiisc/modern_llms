@@ -55,6 +55,13 @@ class MultiHeadedLatentAttention(nn.Module):
         k_up: [num_heads * nope_dim, kv_latent_dim]
         v_up: [num_heads * head_dim, kv_latent_dim]
         proj: [embed_dim, num_heads * head_dim], the output projection
+        q_norm, k_norm (with `qk_norm`): RMSNorm gains [head_dim], shared
+            by all heads
+
+    With `qk_norm`, each head's query and key are RMS-normalized over the
+    whole head right before attention (after RoPE, which doesn't change the
+    rope slice's norm). The cache is unchanged: it still holds `c` and the
+    rotated `k_rope`, and K is normalized after it is re-materialized.
     """
     def __init__(
             self,
@@ -65,6 +72,7 @@ class MultiHeadedLatentAttention(nn.Module):
             kv_latent_dim: int,
             block_size: int,
             dropout: float,
+            qk_norm: bool = False,
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
@@ -100,6 +108,8 @@ class MultiHeadedLatentAttention(nn.Module):
             bias=False
         )
         self.dropout = nn.Dropout(dropout)
+        self.q_norm = nn.RMSNorm(head_dim, eps=1e-6) if qk_norm else None
+        self.k_norm = nn.RMSNorm(head_dim, eps=1e-6) if qk_norm else None
 
         # Fused SDPA (FlashAttention / memory-efficient kernels) when this
         # torch has it; otherwise an explicit causal mask buffer is needed.
@@ -210,6 +220,8 @@ class MultiHeadedLatentAttention(nn.Module):
         q = torch.cat([q_nope, q_rope], dim=-1)
         k = torch.cat(
             [k_nope, k_rope.expand(-1, n_heads, -1, -1)], dim=-1)
+        if self.q_norm is not None and self.k_norm is not None:
+            q, k = self.q_norm(q), self.k_norm(k)
 
         if self.flash:
             # SDPA's is_causal aligns the mask top-left, which is only right

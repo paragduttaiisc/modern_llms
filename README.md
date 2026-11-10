@@ -113,10 +113,11 @@ flowchart LR
     c --> kup["k_up"] --> kn["k_nope"]
     c --> vup["v_up"] --> v["V"]
 
-    qn --> attn["Scaled dot-product attention<br/>Q = [q_nope | q_rope]<br/>K = [k_nope | k_rope]"]
-    rq --> attn
-    kn --> attn
-    rk --> attn
+    qn --> qkn["QK-norm<br/>RMSNorm per head<br/>Q = [q_nope | q_rope]<br/>K = [k_nope | k_rope]"]
+    rq --> qkn
+    kn --> qkn
+    rk --> qkn
+    qkn --> attn["Scaled dot-product attention"]
     v --> attn
     attn --> proj["proj"] --> out(["output"])
 
@@ -126,6 +127,7 @@ flowchart LR
 
 - `kv_down` projects each token to a small latent (`--kv-latent-size`) plus one RoPE key (`--rope-size`). Only these two are cached, not the full per-head K and V. K and V are rebuilt from the cache with `k_up` / `v_up` at every step.
 - RoPE is applied only to the `rope` slices. The single `k_rope` head is shared by all query heads.
+- **QK-norm:** each head's full query and key are RMS-normalized (with a learnable gain) right before attention. This bounds the attention logits. Without it, a GPT-3 Large-sized MoE trained with Muon diverged after ~1300 steps: logits grew to ~2000 and every head attended to a single token. The cache is unaffected, since K is normalized after it is rebuilt from the latent. `--no-qk-norm` turns it off.
 - With a cache and several new tokens (verifying speculative drafts), attention uses an explicit bottom-right-aligned causal mask.
 
 </details>
@@ -165,7 +167,7 @@ One [muonium](https://pypi.org/project/muonium/) `Muon` optimizer with a differe
 | MoE expert weights (3-D) | Muon, per expert |
 | Embedding / LM head, routers, mHC, norms and other 1-D params | AdamW (weight decay only for ≥ 2-D) |
 
-Muon momentum and AdamW moments are kept in fp32. All groups share one learning-rate schedule (linear warmup, cosine decay to 0.1×, then constant) with separate base learning rates (`--muon-lr`, `--adamw-lr`).
+Muon momentum and AdamW moments are kept in fp32. The AdamW parameters also keep an fp32 master copy: with bf16 weights alone, an AdamW step of ~1e-3 on a norm gain of 1.0 is smaller than half a bf16 step and is rounded away, so the gains never trained. All groups share one learning-rate schedule (linear warmup, cosine decay to 0.1×, then constant) with separate base learning rates (`--muon-lr`, `--adamw-lr`).
 
 </details>
 
@@ -325,6 +327,7 @@ Every size must give whole-number dimensions (768·f, 12·f heads, 128·f latent
 | `--n-heads` | 12 | Attention heads |
 | `--attn-head-size` | 64 | Per-head dimension |
 | `--rope-size` | 16 | RoPE part of each head |
+| `--no-qk-norm` | off | Leave out the per-head query/key RMSNorm (as runs before it was added) |
 | `--legacy-rope-positions` | off | Compute RoPE positions in the activations' dtype, as runs before the fp32 fix did (in bf16 this rounds positions above 256) |
 | `--kv-latent-size` | 128 | MLA latent size |
 | `--mlp-hidden-size` | 3072 | FFN width (SwiGLU uses 2/3 of it, rounded up to a multiple of 256) |

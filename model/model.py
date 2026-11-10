@@ -222,6 +222,7 @@ class Model(PreTrainedModel, GenerationMixin):
             activation=config.non_linearity,
             dropout=config.dropout,
             exact_ffn_hidden=config.ff_hidden_exact,
+            qk_norm=getattr(config, "qk_norm", False),
         )
 
     def weight_init(self, module):
@@ -955,6 +956,8 @@ class Model(PreTrainedModel, GenerationMixin):
                 return w[:, :d, :hidden]
             if w.ndim == 1 and ("rms_norm" in name or "mtp_norms" in name):
                 return w[:d]
+            if last in (["q_norm", "weight"], ["k_norm", "weight"]):
+                return w  # head dim is never nested
             raise NotImplementedError(f"don't know how to slice {name}")
 
         param = next(self.parameters())
