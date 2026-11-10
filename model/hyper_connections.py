@@ -11,6 +11,10 @@ class MHCRouter(nn.Module):
         self.phi_pre = nn.Linear(embedding_size, n_streams, bias=True)
         self.phi_post = nn.Linear(embedding_size, n_streams, bias=True)
         self.phi_res = nn.Linear(embedding_size, n_streams * n_streams, bias=True)
+        # Tags read by Model.weight_init (small init; phi_res bias = 0.1 * I)
+        for proj in (self.phi_pre, self.phi_post, self.phi_res):
+            proj.is_mhc_projection = True
+        self.phi_res.is_mhc_residual = True
 
         self.alpha_pre = nn.Parameter(torch.ones(1))
         self.alpha_post = nn.Parameter(torch.ones(1))

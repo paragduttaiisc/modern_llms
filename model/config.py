@@ -24,6 +24,7 @@ class ModelConfig(PreTrainedConfig):
             n_future_tokens: int = 1,
             mtp_loss_weight: float = 1.0,
             mtp_checkpoint: bool = True,
+            block_checkpoint: bool = False,
             draft_vocab_size: int = 0,
             mtp_position_frac: float = 1.0,
             matryoshka_fracs: list[float] | None = None,
@@ -51,6 +52,8 @@ class ModelConfig(PreTrainedConfig):
         self.n_future_tokens = n_future_tokens
         self.mtp_loss_weight = mtp_loss_weight
         self.mtp_checkpoint = mtp_checkpoint
+        # Recompute each trunk block in backward (activation checkpointing)
+        self.block_checkpoint = block_checkpoint
         self.vocab_size = vocab_size
         self.block_size = block_size
         self.dropout = dropout

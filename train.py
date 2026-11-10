@@ -4,7 +4,7 @@ import os
 
 import numpy as np
 import torch
-from accelerate import Accelerator
+from accelerate import PartialState
 from transformers import TrainingArguments, set_seed
 
 from model import Model, ModelConfig
@@ -41,18 +41,23 @@ def main(args: argparse.Namespace):
             int(os.environ.get("WORLD_SIZE", torch.cuda.device_count()))
         effective_batch_size *= world_size
     effective_token_size = effective_batch_size * args.block_size
-    accelerator = Accelerator(
-        mixed_precision="bf16", gradient_accumulation_steps=\
-            args.grad_accum_steps if args.grad_accum_steps != -1 else\
-                math.ceil(effective_tokens_target / effective_token_size))
+    grad_accum_steps = args.grad_accum_steps if args.grad_accum_steps != -1\
+        else math.ceil(effective_tokens_target / effective_token_size)
+    if args.fsdp:
+        # Pure bf16: Accelerate's FSDP2 upcasts the weights to fp32 masters
+        # whenever mixed precision is on, so turn it off. The model is cast
+        # to bf16 below; optimizer moments are fp32 (see MuonFP32State).
+        os.environ["ACCELERATE_MIXED_PRECISION"] = "no"
+    accelerator = PartialState()
     if accelerator.is_main_process:
         print("Targeted Effective tokens:", hrn(args.effective_tokens_target))
         print("Num of GPUs:", world_size)
         print("Batch size per GPU:", args.batch_size)
         print("Sequence length:", args.block_size)
         print("Total effective token size:", hrn(effective_token_size))
-        print("Gradient accumulation steps:",
-              accelerator.gradient_accumulation_steps)
+        print("Gradient accumulation steps:", grad_accum_steps)
+        if args.fsdp:
+            print("FSDP2 ZeRO-2 (shard_grad_op), pure bf16 weights and grads")
 
     # Prepare data
     tokenizer = get_tokenizer()
@@ -66,7 +71,7 @@ def main(args: argparse.Namespace):
     trainset = TokenDataset(
         args.shard_list_file, block_size=args.block_size, subset="train",
         resume_iter=resume_iter, batch_size=effective_token_size *
-        accelerator.gradient_accumulation_steps)
+        grad_accum_steps)
     valset = TokenDataset(
         args.shard_list_file, block_size=args.block_size, subset="val")
     if accelerator.is_main_process:
@@ -94,6 +99,7 @@ def main(args: argparse.Namespace):
         n_future_tokens=args.n_future_tokens,
         mtp_loss_weight=args.mtp_loss_weight,
         mtp_checkpoint=not args.no_mtp_checkpoint,
+        block_checkpoint=args.activation_checkpointing,
         draft_vocab_size=args.draft_vocab_size if args.n_future_tokens > 1 else 0,
         mtp_position_frac=args.mtp_position_frac,
         matryoshka_fracs=matryoshka_fracs,
@@ -135,13 +141,18 @@ def main(args: argparse.Namespace):
         eval_on_start=not args.dont_eval,
         eval_strategy="no" if args.dont_eval else "steps",
         eval_steps=None if args.dont_eval else args.eval_interval,
-        gradient_accumulation_steps=accelerator.gradient_accumulation_steps,
+        gradient_accumulation_steps=grad_accum_steps,
         save_total_limit=0 if args.dont_save else 5,
         save_strategy="no" if args.dont_save else "steps",
         save_steps=-1 if args.dont_save else args.save_interval,
         learning_rate=args.adamw_lr,
         weight_decay=args.adamw_weight_decay,
-        bf16=True,
+        bf16=not args.fsdp,
+        # ZeRO-2: gradients and optimizer state sharded, weights gathered
+        # once per step and kept through backward (FSDP2 shard_grad_op).
+        fsdp="shard_grad_op auto_wrap" if args.fsdp else "",
+        fsdp_config={"version": 2, "transformer_layer_cls_to_wrap": ["Block"]}
+            if args.fsdp else None,
         logging_steps=args.log_interval,
         run_name=args.wandb_run_name,
         project=args.wandb_project,
@@ -210,6 +221,8 @@ if __name__ == "__main__":
     parser.add_argument("--matryoshka-full-prob", type=float, default=0.5, help="Probability a micro-batch trains the full model (else a smaller size, uniformly)")
     parser.add_argument("--matryoshka-full-per-step", action="store_true", help="Make the first micro-batch of every optimizer step full size (recommended: prevents divergence)")
     parser.add_argument("--matryoshka-all-sizes", action="store_true", help="Train every Matryoshka size on every micro-batch (loss = sum over sizes) instead of sampling one")
+    parser.add_argument("--fsdp", action="store_true", help="ZeRO-2 via FSDP2: shard gradients and optimizer state across GPUs (pure bf16 weights)")
+    parser.add_argument("--activation-checkpointing", action="store_true", help="Recompute every transformer block in backward to save activation memory")
     parser.add_argument("--use-fused-optimizer", type=bool, default=True)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--effective-tokens-target", type=int, default=2**19)

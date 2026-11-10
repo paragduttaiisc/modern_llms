@@ -148,18 +148,16 @@ class Model(PreTrainedModel, GenerationMixin):
 
     def weight_init(self, module):
         if isinstance(module, nn.Linear):
-            if (
-                any(x in type(module).__name__ for x in ["MHCRouter"])
-                or (
-                    hasattr(module, 'out_features')
-                    and
-                    module.out_features in [4, 16]
-            )):
+            # mHC projections are tagged by MHCRouter. (This used to match any
+            # Linear with 4 or 16 outputs, which also caught 4/16-expert
+            # routers.)
+            if getattr(module, "is_mhc_projection", False):
                 nn.init.normal_(module.weight, mean=0.0, std=0.001)
                 if module.bias is not None:
-                    if module.out_features == 16: # TODO: make more general
+                    if getattr(module, "is_mhc_residual", False):
+                        n = math.isqrt(module.out_features)
                         with torch.no_grad():
-                            module.bias.copy_(torch.eye(4).view(-1) * 0.1)
+                            module.bias.copy_(torch.eye(n).view(-1) * 0.1)
                     else:
                         nn.init.zeros_(module.bias)
             else:
@@ -232,15 +230,24 @@ class Model(PreTrainedModel, GenerationMixin):
         frac: float,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         aux_losses = []
+        recompute = getattr(self.config, "block_checkpoint", False)\
+            and self.training and torch.is_grad_enabled()\
+            and past_key_values is None
         for i, layer in enumerate(self.layers):
-            x, router_loss = layer(
-                x,
-                self.rotary_emb,
-                past_key_values=past_key_values,
-                past_length=past_length,
-                layer_idx=i,
-                frac=frac,
-            )
+            if recompute:
+                x, router_loss = checkpoint(
+                    layer, x, self.rotary_emb, past_key_values=None,
+                    past_length=past_length, layer_idx=i, frac=frac,
+                    use_reentrant=False)
+            else:
+                x, router_loss = layer(
+                    x,
+                    self.rotary_emb,
+                    past_key_values=past_key_values,
+                    past_length=past_length,
+                    layer_idx=i,
+                    frac=frac,
+                )
             if router_loss is not None:
                 aux_losses.append(router_loss)
         return x, aux_losses
@@ -293,8 +300,8 @@ class Model(PreTrainedModel, GenerationMixin):
         if self._uses_draft_vocab(head_idx):
             mapped = self.vocab_to_draft[targets.clamp_min(0)]
             targets = torch.where(targets == -100, -100, mapped)
-        ce = F.cross_entropy(
-            self._head_logits(head_idx, h),
+        ce = F.cross_entropy(  # fp32 loss even without autocast
+            self._head_logits(head_idx, h).float(),
             targets,
             ignore_index=-100,
             reduction="sum",
@@ -451,7 +458,7 @@ class Model(PreTrainedModel, GenerationMixin):
             B, T, C = logits.shape
 
             lm_loss = per_token = F.cross_entropy(
-                logits.view(-1, C),
+                logits.view(-1, C).float(),
                 labels.view(-1),
                 ignore_index=-100,
                 reduction="none",

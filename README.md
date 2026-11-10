@@ -195,6 +195,17 @@ accelerate launch --num_processes=8 --mixed_precision=bf16 train.py --use-bf16 -
     --wandb-run-name="<RunName>"
 ```
 
+### Larger models (ZeRO-2)
+
+`--fsdp` shards gradients and optimizer state across GPUs (FSDP2 `shard_grad_op`, i.e. ZeRO-2) while each GPU keeps a full copy of the weights during the step. Weights and gradients stay bf16 (mixed precision is turned off so Accelerate does not upcast them to fp32); Muon momentum and AdamW moments are fp32. `--activation-checkpointing` recomputes every transformer block in backward. Example: a GPT-3 Large-shaped MoE (24 layers, d_model 1536, 16 heads of 96) with 12 experts, 3 active, for 2.95B total / 0.91B active parameters:
+
+```bash
+accelerate launch --num_processes=8 train.py --fsdp --embed-size=1536 --n-layers=24 --n-heads=16 \
+    --attn-head-size=96 --rope-size=32 --kv-latent-size=384 --mlp-hidden-size=3072 \
+    --n-experts=12 --n-active-experts=3 --batch-size=4 --shard-list-file=data/llm_mix_100B.json \
+    --wandb-run-name="<RunName>"
+```
+
 ### Key arguments
 
 | Argument | Default | Purpose |
@@ -220,6 +231,8 @@ accelerate launch --num_processes=8 --mixed_precision=bf16 train.py --use-bf16 -
 | `--matryoshka-full-prob` | 0.5 | Probability a micro-batch trains the full model (else a smaller size, uniformly) |
 | `--matryoshka-full-per-step` | off | First micro-batch of every optimizer step is the full model (the overall full share stays at `--matryoshka-full-prob`). Recommended: without it, steps with no full-size gradient made training diverge |
 | `--matryoshka-all-sizes` | off | Train every size on every micro-batch (loss = sum over sizes) instead of sampling one; `--matryoshka-full-prob` is then unused, and it cannot be combined with `--matryoshka-full-per-step` |
+| `--fsdp` | off | ZeRO-2 via FSDP2: shard gradients and optimizer state across GPUs; weights and gradients stay bf16 |
+| `--activation-checkpointing` | off | Recompute every transformer block in backward (saves activation memory, costs extra compute) |
 | `--n-res-streams` | 1 | Number of residual streams for mHC routing (1 = plain residual) |
 | `--effective-tokens-target` | 2^19 | Target tokens for gradient accumulation calculation |
 | `--muon-lr` | 0.02 | Muon optimizer learning rate |
@@ -282,7 +295,8 @@ Logs are sent to WandB (online/offline) or TensorBoard, tracking loss, perplexit
 ### Planned 🚧
 
 - [ ] **Sparse attention via token clustering** — Group every N tokens and attend only to representative cluster centroids, reducing attention from O(T²) to O(T·C).
-- [ ] **Linear attention / State Space Models** — Replace softmax attention with SSM-based mixing (RWKV, Mamba-style) for O(T) sequence complexity.
+- [ ] **Hybrid SSM / linear-attention layers** — Replace most attention layers with Gated DeltaNet or Mamba-2 layers, keeping about 1 MLA layer in 4 (as in Qwen3-Next, Kimi Linear, Nemotron-H). Each such layer keeps a fixed-size state instead of a per-token KV cache, so decoding costs the same per token at any context length; past ~1k tokens the state is smaller than MLA's cache. Needs long-context training (16k+) to show the benefit; speculative decoding must save and restore recurrent states instead of cropping the cache.
+- [ ] **Looped (recurrent-depth) transformers** — Reuse a block several times per token, with the number of loops chosen at inference: more loops for hard problems, early exit for easy tokens, and few-loop drafts verified by full loops for self-speculative decoding.
 - [ ] **Engrams** — Learnable external memory bank (key-value store) for long-range information retrieval beyond the context window.
 - [ ] **Supervised fine-tuning (SFT)** — Instruction-following training pipeline with formatted prompt templates.
 - [ ] **RLHF / DPO / GRPO** — Preference optimization without a separate reward model.

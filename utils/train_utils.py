@@ -5,12 +5,62 @@ import time
 
 import torch
 from muonium import Muon
+from torch.optim.adam import adam
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from transformers import Trainer
 
 from .data_utils import HellaswagDataset, hellaswag_collate_fn
 from .misc_utils import human_readable_numbers as hrn
+
+
+class MuonFP32State(Muon):
+    """Muon whose AdamW groups keep their moments in fp32.
+
+    muonium already keeps Muon momentum in fp32, but its AdamW moments take
+    the parameter dtype (bf16 here). The weights stay bf16: each AdamW step
+    runs on fp32 copies of the weights and gradients, and the result is
+    rounded back into the bf16 weights. Works on FSDP2 (DTensor) params too.
+    """
+
+    def _step_adam_group(self, group: dict) -> None:
+        params, params32, grads32, exp_avgs, exp_avg_sqs, steps =\
+            [], [], [], [], [], []
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+            state = self.state[p]
+            if len(state) == 0:
+                state["step"] = torch.tensor(0.0)
+                state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
+                state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
+            for key in ("exp_avg", "exp_avg_sq"):  # older bf16 checkpoints
+                if state[key].dtype != torch.float32:
+                    state[key] = state[key].float()
+            if state["step"].device.type != "cpu":
+                state["step"] = state["step"].cpu()
+            params.append(p)
+            params32.append(p.detach().float())
+            grads32.append(p.grad.float())
+            exp_avgs.append(state["exp_avg"])
+            exp_avg_sqs.append(state["exp_avg_sq"])
+            steps.append(state["step"])
+        if not params:
+            return
+        lr, wd = group["lr"], group["wd"]
+        beta1, beta2 = group["betas"]
+        adam(
+            params32, grads32, exp_avgs, exp_avg_sqs, [], steps,
+            amsgrad=False, has_complex=False, beta1=beta1, beta2=beta2,
+            lr=float(lr) if torch.is_tensor(lr) else lr,
+            weight_decay=float(wd) if torch.is_tensor(wd) else wd,
+            eps=group["eps"], maximize=group["maximize"], capturable=False,
+            differentiable=False, fused=False, foreach=True,
+            decoupled_weight_decay=group["decoupled_weight_decay"],
+        )
+        with torch.no_grad():  # (DTensor has no _foreach_copy_)
+            for p, p32 in zip(params, params32):
+                p.copy_(p32)
 
 
 class LLMTrainer(Trainer):
@@ -145,7 +195,7 @@ class LLMTrainer(Trainer):
                 f"AdamW (No Decay): {len(adamw_nodecay_params)} tensors, "
                 f"{hrn(sum_p(adamw_nodecay_params))} params")
 
-        self.optimizer = Muon([{
+        self.optimizer = MuonFP32State([{
             "params": muon_2d_params,
             "algorithm": "muon",
         }, {
@@ -168,12 +218,14 @@ class LLMTrainer(Trainer):
             "params": adamw_nodecay_params,
             "algorithm": "adamw",
             "lr": self.args.learning_rate,
-            "weight_decay": 0.0,
+            # muonium reads "wd"; a "weight_decay" key would be ignored and
+            # the group would get the Muon default (muon_weight_decay).
+            "wd": 0.0,
         }, {
             "params": adamw_decay_params,
             "algorithm": "adamw",
             "lr": self.args.learning_rate,
-            "weight_decay": self.args.weight_decay,
+            "wd": self.args.weight_decay,
         }], lr=self.muon_lr, wd=self.muon_weight_decay,
         orthogonalization_strategy="newton_schulz", use_cautious_wd=False,
         adam_betas=(self.args.adam_beta1, self.args.adam_beta2),

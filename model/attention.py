@@ -133,7 +133,7 @@ class MultiHeadedLatentAttention(nn.Module):
                 T_k = k.shape[-2]
                 causal_mask = self.mask[T_k - T:T_k, :T_k] # type: ignore
                 att = att.masked_fill(causal_mask == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
+            att = F.softmax(att.float(), dim=-1).to(v.dtype)
             att = self.dropout(att)
             out = att @ v
 
