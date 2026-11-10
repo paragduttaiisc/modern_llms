@@ -37,7 +37,11 @@ from transformers import (
 
 from model import Model, ModelConfig
 from utils import get_tokenizer
-from utils.fast_decode import graph_greedy_decode, graph_speculative_decode
+from utils.fast_decode import (
+    DecodeEngine,
+    graph_greedy_decode,
+    graph_speculative_decode,
+)
 from utils.spec_decode import greedy_decode, speculative_decode
 
 
@@ -70,13 +74,27 @@ def run_speculative(model, tokenizer, args: argparse.Namespace,
     # --cuda-graphs: the same decoders with a static cache and captured
     # steps (utils/fast_decode.py), which removes the per-kernel launch
     # overhead that dominates batch-1 decoding.
-    greedy_fn = graph_greedy_decode if args.cuda_graphs else greedy_decode
-    spec_fn = graph_speculative_decode if args.cuda_graphs\
-        else speculative_decode
-    run_greedy = lambda: greedy_fn(  # noqa: E731
-        model, input_ids, args.max_new_tokens, eos)
-    run_spec = lambda: spec_fn(  # noqa: E731
-        model, input_ids, args.max_new_tokens, eos, draft_model=draft)
+    # --compile additionally fuses each step's kernels with torch.compile.
+    # The engines keep the captured (and compiled) steps, so the warm-up
+    # below pays for capture and compilation once.
+    if args.cuda_graphs:
+        n = (model if draft is None else draft).n_future_tokens
+        max_len = input_ids.shape[1] + args.max_new_tokens + 2 * n
+        engine = DecodeEngine(model, max_len, compile=args.compile)
+        draft_engine = None if draft is None\
+            else DecodeEngine(draft, max_len, compile=args.compile)
+        run_greedy = lambda: graph_greedy_decode(  # noqa: E731
+            model, input_ids, args.max_new_tokens, eos, engine=engine)
+        run_spec = lambda: graph_speculative_decode(  # noqa: E731
+            model, input_ids, args.max_new_tokens, eos, draft_model=draft,
+            engine=engine, draft_engine=draft_engine)
+    else:
+        if args.compile:
+            raise ValueError("--compile needs --cuda-graphs")
+        run_greedy = lambda: greedy_decode(  # noqa: E731
+            model, input_ids, args.max_new_tokens, eos)
+        run_spec = lambda: speculative_decode(  # noqa: E731
+            model, input_ids, args.max_new_tokens, eos, draft_model=draft)
     # Warm-up: the first calls pay for CUDA context setup, kernel selection
     # and allocator growth, which would distort the timings below.
     run_greedy(); run_spec()  # warm-up
@@ -222,6 +240,7 @@ if __name__ == "__main__":
     parser.add_argument("--matryoshka-frac", type=float, default=1.0, help="Run a smaller nested size (extracted from a Matryoshka checkpoint)")
     parser.add_argument("--draft-frac", type=float, default=0.0, help="With --speculative: draft with this nested Matryoshka size's MTP heads and verify with the full model (0 = self-speculation)")
     parser.add_argument("--cuda-graphs", action="store_true", help="With --speculative: decode with a static cache and CUDA graphs (dense models; much less launch overhead)")
+    parser.add_argument("--compile", action="store_true", help="With --cuda-graphs: also fuse each decoding step's kernels with torch.compile (slow first run)")
     args = parser.parse_args()
     set_seed(args.seed)
     main(args)

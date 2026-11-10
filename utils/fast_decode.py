@@ -130,14 +130,6 @@ class GraphedStep:
         return self.out
 
 
-def _prefill(fn: Callable[[torch.Tensor], torch.Tensor],
-             cache: StaticLatentCache, input_ids: torch.Tensor):
-    """Run the prompt eagerly through the static cache."""
-    out = fn(input_ids)
-    cache.advance(input_ids.shape[1])
-    return out
-
-
 def _next_token_fn(model, cache):
     """ids [1, T] -> the model's greedy next token at each position [T]."""
     def fn(ids):
@@ -153,25 +145,80 @@ def _all_heads_fn(model, cache):
     return fn
 
 
+class DecodeEngine:
+    """A model's static cache plus its captured steps, reusable across prompts.
+
+    `kind` is "next" (the next-token head, for greedy decoding and
+    verification) or "heads" (every head, for drafting). Steps are built on
+    first use for each (kind, T) and replayed afterwards, so capture, and
+    compilation with `compile=True`, happen once per engine rather than per
+    prompt. `max_len` bounds prompt + generated tokens (+ one draft block).
+
+    `compile=True` runs each step function through `torch.compile`
+    (Inductor), which fuses the many small elementwise kernels of a forward
+    pass into fewer ones, before the CUDA graph captures it. The prompt is
+    always run eagerly (its length varies).
+    """
+
+    def __init__(self, model, max_len: int, compile: bool = False):
+        self.model = model
+        self.cache = StaticLatentCache(model, max_len)
+        self.compile = compile
+        self._fns = {"next": _next_token_fn(model, self.cache),
+                     "heads": _all_heads_fn(model, self.cache)}
+        self._steps: dict[tuple[str, int], GraphedStep] = {}
+
+    def reset(self, needed: int) -> None:
+        """Start a new sequence that will use up to `needed` positions."""
+        if needed > self.cache.max_len:
+            raise ValueError(f"needs {needed} cache positions, engine has "
+                             f"{self.cache.max_len}")
+        self.cache.length.zero_()
+
+    def prefill(self, kind: str, ids: torch.Tensor) -> torch.Tensor:
+        """Run the prompt eagerly through the static cache."""
+        out = self._fns[kind](ids)
+        self.cache.advance(ids.shape[1])
+        return out
+
+    def step(self, kind: str, ids: torch.Tensor) -> torch.Tensor:
+        """Replay the captured step for `ids` [1, T] (built on first use)."""
+        key = (kind, ids.shape[1])
+        if key not in self._steps:
+            fn = self._fns[kind]
+            if self.compile:
+                fn = torch.compile(fn, dynamic=False)
+            self._steps[key] = GraphedStep(fn, self.cache, ids.shape[1])
+        return self._steps[key](ids)
+
+    def rewind(self, n: int) -> None:
+        self.cache.rewind(n)
+
+
 @torch.no_grad()
 def graph_greedy_decode(
     model,
     input_ids: torch.Tensor,
     max_new_tokens: int,
     eos_token_id: int | None = None,
+    engine: DecodeEngine | None = None,
 ) -> DecodeResult:
-    """`greedy_decode` with a static cache and a captured 1-token step."""
+    """`greedy_decode` with a static cache and a captured 1-token step.
+
+    Pass a `DecodeEngine` to reuse its captured (and compiled) step across
+    calls; otherwise a temporary one is built.
+    """
     assert input_ids.shape[0] == 1, "batch size 1 only"
-    cache = StaticLatentCache(model, input_ids.shape[1] + max_new_tokens + 1)
-    fn = _next_token_fn(model, cache)
-    nxt = _prefill(fn, cache, input_ids)[-1:]
-    step = GraphedStep(fn, cache, 1)
+    needed = input_ids.shape[1] + max_new_tokens + 1
+    engine = engine or DecodeEngine(model, needed)
+    engine.reset(needed)
+    nxt = engine.prefill("next", input_ids)[-1:]
     n_forwards, tokens = 1, []
     while True:
         tokens.append(int(nxt))
         if _done(tokens, max_new_tokens, eos_token_id):
             break
-        nxt = step(nxt[None, :])
+        nxt = engine.step("next", nxt[None, :])
         n_forwards += 1
     return DecodeResult(tokens=tokens, n_forwards=n_forwards)
 
@@ -183,34 +230,35 @@ def graph_speculative_decode(
     max_new_tokens: int,
     eos_token_id: int | None = None,
     draft_model=None,
+    engine: DecodeEngine | None = None,
+    draft_engine: DecodeEngine | None = None,
 ) -> DecodeResult:
     """`speculative_decode` with static caches and captured n-token steps.
 
     Same algorithm and output: with `draft_model=None` the model's own MTP
     heads draft (one cache, one graph); otherwise `draft_model`'s heads
-    draft and `model` verifies (two caches, two graphs per step).
+    draft and `model` verifies (two caches, two graphs per step). Pass
+    `engine` (for `model`) and `draft_engine` (for `draft_model`) to reuse
+    their captured steps across calls.
     """
     assert input_ids.shape[0] == 1, "batch size 1 only"
     drafter = model if draft_model is None else draft_model
     n = drafter.n_future_tokens
     if n < 2:
         raise ValueError("speculative decoding needs n_future_tokens > 1")
-    max_len = input_ids.shape[1] + max_new_tokens + 2 * n
+    needed = input_ids.shape[1] + max_new_tokens + 2 * n
 
-    draft_cache = StaticLatentCache(drafter, max_len)
-    draft_fn = _all_heads_fn(drafter, draft_cache)
     if draft_model is None:
-        cache, verify_fn = draft_cache, None
+        engine = draft_engine = engine or DecodeEngine(model, needed)
     else:
-        cache = StaticLatentCache(model, max_len)
-        verify_fn = _next_token_fn(model, cache)
+        engine = engine or DecodeEngine(model, needed)
+        draft_engine = draft_engine or DecodeEngine(draft_model, needed)
+        draft_engine.reset(needed)
+    engine.reset(needed)
+    separate = draft_engine is not engine
 
-    preds = _prefill(draft_fn, draft_cache, input_ids)  # [n, T]
-    verify = preds[0] if verify_fn is None\
-        else _prefill(verify_fn, cache, input_ids)
-    draft_step = GraphedStep(draft_fn, draft_cache, n)
-    verify_step = None if verify_fn is None\
-        else GraphedStep(verify_fn, cache, n)
+    preds = draft_engine.prefill("heads", input_ids)  # [n, T]
+    verify = engine.prefill("next", input_ids) if separate else preds[0]
 
     n_forwards = 1
     block = torch.cat([verify[-1:], preds[1:, -1]])
@@ -222,9 +270,9 @@ def graph_speculative_decode(
             break
         # The graphs' outputs are overwritten by the next replay; the
         # comparisons below copy what they need to the CPU first.
-        preds = draft_step(block[None, :])
-        verify = preds[0] if verify_step is None\
-            else verify_step(block[None, :])
+        preds = draft_engine.step("heads", block[None, :])
+        verify = engine.step("next", block[None, :]) if separate\
+            else preds[0]
         n_forwards += 1
         verify_list, drafts = verify.tolist(), block.tolist()
         n_acc = 0
@@ -238,12 +286,12 @@ def graph_speculative_decode(
             break
         # Keep block[0..n_acc]; rewinding the length is all a crop needs.
         if n_acc + 1 < n:
-            draft_cache.rewind(n - (n_acc + 1))
-            if cache is not draft_cache:
-                cache.rewind(n - (n_acc + 1))
+            draft_engine.rewind(n - (n_acc + 1))
+            if separate:
+                engine.rewind(n - (n_acc + 1))
         block = torch.cat([verify[n_acc:n_acc + 1], preds[1:, n_acc]])
 
     return DecodeResult(
         tokens=tokens[:max_new_tokens], n_forwards=n_forwards,
         accepted_hist=accepted_hist,
-        n_draft_forwards=0 if draft_model is None else n_forwards)
+        n_draft_forwards=n_forwards if separate else 0)
