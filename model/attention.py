@@ -91,7 +91,7 @@ class MultiHeadedLatentAttention(nn.Module):
             x: torch.Tensor,
             rotary_emb: RotaryEmbedding,
             past_key_values: Cache | None = None,
-            past_length: int | None = 0,
+            past_length: int = 0,
             layer_idx: int | None = None,
             frac: float = 1.0,
     ) -> torch.Tensor:
@@ -137,14 +137,15 @@ class MultiHeadedLatentAttention(nn.Module):
 
         # Rotate only the rope slices; the offset gives cached decoding the
         # absolute positions of the new tokens.
-        q_rope = rotary_emb.rotate_queries_or_keys(q_rope, offset=past_length) # type: ignore
-        k_rope = rotary_emb.rotate_queries_or_keys(k_rope, offset=past_length) # type: ignore
+        q_rope = rotary_emb.rotate_queries_or_keys(q_rope, offset=past_length)
+        k_rope = rotary_emb.rotate_queries_or_keys(k_rope, offset=past_length)
 
         # The cache stores the latent c and the already-rotated k_rope (not
         # full per-head K/V); update() appends the new tokens and returns
         # the whole history: c [B, T_k, latent], k_rope [B, 1, T_k, rope].
         if past_key_values is not None:
-            c, k_rope = past_key_values.update(c, k_rope, layer_idx) # type: ignore
+            assert layer_idx is not None, "a KV cache needs the layer index"
+            c, k_rope = past_key_values.update(c, k_rope, layer_idx)
 
         T_k = c.shape[1]
 
@@ -184,7 +185,7 @@ class MultiHeadedLatentAttention(nn.Module):
             att = q @ k.transpose(-2, -1) * (self.head_dim ** -0.5)
             if T > 1:
                 T_k = k.shape[-2]
-                causal_mask = self.mask[T_k - T:T_k, :T_k] # type: ignore
+                causal_mask = self.mask[T_k - T:T_k, :T_k]  # pyright: ignore[reportIndexIssue]
                 att = att.masked_fill(causal_mask == 0, float('-inf'))
             # Softmax in fp32 for stability under bf16
             att = F.softmax(att.float(), dim=-1).to(v.dtype)

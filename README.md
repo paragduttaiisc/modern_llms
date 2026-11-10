@@ -361,6 +361,7 @@ Every size must give whole-number dimensions (768·f, 12·f heads, 128·f latent
 | `--warmup-iters` / `--last-decay-iter` | 200 / 17150 | End of warmup / end of cosine decay |
 | `--muon-lr` / `--adamw-lr` | 0.02 / 1e-3 | Base learning rates |
 | `--muon-weight-decay` / `--adamw-weight-decay` | 0.01 / 0.1 | Weight decay |
+| `--betas` / `--optimizer-epsilon` | 0.9 0.95 / 1e-8 | AdamW betas and epsilon |
 | `--max-grad-norm` | 1.0 | Gradient clipping |
 | `--fsdp` | off | ZeRO-2 via FSDP2 (pure-bf16 weights and gradients) |
 | `--activation-checkpointing` | off | Recompute each block in backward |

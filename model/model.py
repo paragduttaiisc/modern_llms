@@ -52,8 +52,9 @@ class Model(PreTrainedModel, GenerationMixin):
     # Declared for the type checker: nn.Module.__getattr__ would otherwise
     # type buffers and `config` as a generic Tensor | Module.
     config: ModelConfig
-    draft_vocab: torch.Tensor
-    vocab_to_draft: torch.Tensor
+    # (Only registered when draft_vocab_size > 0.)
+    draft_vocab: torch.Tensor  # pyright: ignore[reportUninitializedInstanceVariable]
+    vocab_to_draft: torch.Tensor  # pyright: ignore[reportUninitializedInstanceVariable]
 
     _tied_weights_keys = {"lm_head.weight": "tok_emb_table.weight"}  # noqa: RUF012
 
@@ -133,7 +134,8 @@ class Model(PreTrainedModel, GenerationMixin):
         self.last_mtp_losses = None
         # With train_fracs: {frac: (lm loss, MTP head losses | None)} of the
         # last training forward, for the trainer's per-size logging.
-        self.last_losses_by_frac: dict = {}
+        self.last_losses_by_frac: dict[
+            float, tuple[torch.Tensor | None, torch.Tensor | None]] = {}
 
     @torch.no_grad()
     def set_draft_vocab(self, token_ids: torch.Tensor) -> None:
@@ -598,7 +600,7 @@ class Model(PreTrainedModel, GenerationMixin):
         ):
             loss = self._mtp_training_loss(
                 x, labels, aux_losses, num_items_in_batch, frac)
-            return CausalLMOutputWithPast(loss=loss)  # type: ignore
+            return CausalLMOutputWithPast(loss=loss)  # pyright: ignore[reportArgumentType]
 
         h, router_loss = self._run_head(0, x, cache, past_length, frac)
         if router_loss is not None:
@@ -643,8 +645,8 @@ class Model(PreTrainedModel, GenerationMixin):
                 if aux_loss is not None else None
 
         return CausalLMOutputWithPast(
-            logits=logits, # type: ignore
-            loss=loss, # type: ignore
+            logits=logits,  # pyright: ignore[reportArgumentType]
+            loss=loss,  # pyright: ignore[reportArgumentType]
             past_key_values=past_key_values if use_cache else None, # type: ignore
         )
 
@@ -683,7 +685,7 @@ class Model(PreTrainedModel, GenerationMixin):
             self.last_lm_loss, self.last_mtp_losses, self.last_router_loss =\
                 full
         self.last_losses_by_frac = by_frac
-        return CausalLMOutputWithPast(loss=total)  # type: ignore
+        return CausalLMOutputWithPast(loss=total)  # pyright: ignore[reportArgumentType]
 
     @torch.no_grad()
     def forward_all_heads(

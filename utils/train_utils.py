@@ -48,7 +48,7 @@ class MuonFP32State(Muon):
     untouched.
     """
 
-    def _step_adam_group(self, group: dict) -> None:
+    def _step_adam_group(self, group: dict[str, Any]) -> None:
         """One AdamW step for `group`, overriding muonium's version.
 
         Gathers the params that have a gradient, lazily creates fp32
@@ -161,7 +161,7 @@ class LLMTrainer(Trainer):
                              "micro-batch; don't combine it with "
                              "matryoshka_full_per_step")
         # Per-size sums of per-token losses since the last log (see log())
-        self._loss_window: dict[float, dict] = {}
+        self._loss_window: dict[float, dict[str, Any]] = {}
 
         self.block_size = block_size
         self.warmup_iters = warmup_iters
@@ -335,7 +335,7 @@ class LLMTrainer(Trainer):
         }], lr=self.muon_lr, wd=self.muon_weight_decay,
         orthogonalization_strategy="newton_schulz", use_cautious_wd=False,
         adam_betas=(self.args.adam_beta1, self.args.adam_beta2),
-        is_adamw=True, foreach=None)
+        adam_eps=self.args.adam_epsilon, is_adamw=True, foreach=None)
 
         return self.optimizer
 
@@ -425,24 +425,24 @@ class LLMTrainer(Trainer):
         """
         if self.matryoshka_all_sizes:
             frac = 1.0
-            self.model.train_fracs = self.matryoshka_fracs  # type: ignore
+            self._llm.train_fracs = self.matryoshka_fracs
         else:
             frac = self._sample_matryoshka_frac()
-            self.model.active_frac = frac  # type: ignore
+            self._llm.active_frac = frac
         try:
             loss = super().training_step(model, inputs, *args, **kwargs)
         finally:
-            self.model.active_frac = 1.0  # type: ignore  (eval/generation)
-            self.model.train_fracs = []  # type: ignore
+            self._llm.active_frac = 1.0  # (eval/generation)
+            self._llm.train_fracs = []
         # Sum the per-token losses of this micro-batch into the current
         # logging window (detached tensors: no GPU sync here).
         if self.matryoshka_all_sizes:
             per_size = self._llm.last_losses_by_frac
         else:
-            mtp = getattr(self.model, "last_mtp_losses", None)\
+            mtp = getattr(self._llm, "last_mtp_losses", None)\
                 if getattr(self._llm.config, "n_future_tokens", 1) > 1\
                 else None
-            per_size = {frac: (getattr(self.model, "last_lm_loss", None), mtp)}
+            per_size = {frac: (getattr(self._llm, "last_lm_loss", None), mtp)}
         for size, (lm, mtp) in per_size.items():
             window = self._loss_window.setdefault(
                 size, {"n": 0, "lm": None, "mtp": None})
@@ -498,7 +498,7 @@ class LLMTrainer(Trainer):
                 for k, v in batch.items()
             }
 
-            outputs = self.model(**batch, return_per_sample_loss=True) # type: ignore
+            outputs = self._llm(**batch, return_per_sample_loss=True)
 
             # outputs.loss: [B * 4] per-candidate losses -> [B, 4]
             preds = outputs.loss.reshape(-1, 4).argmin(dim=1)
@@ -509,8 +509,8 @@ class LLMTrainer(Trainer):
         correct = torch.tensor([local_correct], device=self.accelerator.device)
         total = torch.tensor([local_total], device=self.accelerator.device)
 
-        correct = self.accelerator.gather(correct).sum() # type: ignore
-        total = self.accelerator.gather(total).sum() # type: ignore
+        correct = cast(torch.Tensor, self.accelerator.gather(correct)).sum()
+        total = cast(torch.Tensor, self.accelerator.gather(total)).sum()
 
         return (correct.float() / total.float()).item()
 
@@ -539,7 +539,7 @@ class LLMTrainer(Trainer):
         # Eval loss of every smaller Matryoshka size, logged as
         # eval_f<size>_loss / eval_f<size>_perplexity
         for frac in self.matryoshka_fracs[1:]:
-            self.model.active_frac = frac  # type: ignore
+            self._llm.active_frac = frac
             try:
                 metrics.update(super().evaluate(
                     eval_dataset=eval_dataset,
@@ -547,11 +547,11 @@ class LLMTrainer(Trainer):
                     metric_key_prefix=f"{metric_key_prefix}_f{frac:g}",
                 ))
             finally:
-                self.model.active_frac = 1.0  # type: ignore
+                self._llm.active_frac = 1.0
 
-        self.model.eval() # type: ignore
+        self._llm.eval()
         hellaswag_acc = self.evaluate_hellaswag()
-        self.model.train() # type: ignore
+        self._llm.train()
 
         # Eval allocates differently shaped buffers (full-vocab logits of the
         # eval batch) than training. Release them so the cached-but-unused
@@ -564,7 +564,7 @@ class LLMTrainer(Trainer):
 
         return metrics
 
-    def _log_window_losses(self, logs: dict) -> None:
+    def _log_window_losses(self, logs: dict[str, Any]) -> None:
         """Log the components of HF's `loss` next to it (like router_loss).
 
         `loss` (HF) stays the optimized objective averaged over the logging
@@ -598,7 +598,7 @@ class LLMTrainer(Trainer):
                 for i, head_loss in enumerate(means[1:]):
                     logs[f"mtp_loss_{i + 1}{suffix}"] = head_loss
 
-    def log(self, logs: dict, *args, **kwargs) -> None:
+    def log(self, logs: dict[str, Any], *args, **kwargs) -> None:
         """Add project metrics to HF's logs before they are reported.
 
         On training logs (those with "loss"): the per-window loss components
@@ -625,15 +625,15 @@ class LLMTrainer(Trainer):
                     logs["iter_time"] = elapsed / steps_passed
                     logs["samples_per_sec"] =\
                         (tokens_passed / self.block_size) / elapsed
-                    if hasattr(self.model, "last_router_loss") and self.model.last_router_loss: # type: ignore
-                        logs["router_loss"] = self.model.last_router_loss.item() # type: ignore
+                    if hasattr(self._llm, "last_router_loss") and self._llm.last_router_loss:
+                        logs["router_loss"] = self._llm.last_router_loss.item()
                     # Per-expert load / token count / router importance,
                     # averaged over the trunk's MoE layers. These come from
                     # the last forward on this rank only (not reduced).
-                    if getattr(self.model.config, "experts", 1) > 1: # type: ignore
-                        avg_load = torch.stack([layer.ffn.last_load.float() for layer in self.model.layers]).mean(0) # type: ignore
-                        avg_tokens = torch.stack([layer.ffn.last_num_tokens.float() for layer in self.model.layers]).mean(0) # type: ignore
-                        avg_importance = torch.stack([layer.ffn.last_importance.float() for layer in self.model.layers]).mean(0) # type: ignore
+                    if getattr(self._llm.config, "experts", 1) > 1:
+                        avg_load = torch.stack([layer.ffn.last_load.float() for layer in self._llm.layers]).mean(0)
+                        avg_tokens = torch.stack([layer.ffn.last_num_tokens.float() for layer in self._llm.layers]).mean(0)
+                        avg_importance = torch.stack([layer.ffn.last_importance.float() for layer in self._llm.layers]).mean(0)
                         for i in range(avg_load.numel()):
                             logs[f"expert_{i}_load"] = avg_load[i].item()
                             logs[f"expert_{i}_tokens"] = avg_tokens[i].item()

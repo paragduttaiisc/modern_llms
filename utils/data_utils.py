@@ -7,6 +7,7 @@ serves the tokenized HellaSwag benchmark for the zero-shot accuracy eval in
 `LLMTrainer.evaluate_hellaswag`.
 """
 import json
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -48,7 +49,7 @@ def get_tokenizer(tokenizer_path: str = "tokenizer") -> PreTrainedTokenizer:
     return tokenizer
 
 
-class TokenDataset(IterableDataset):
+class TokenDataset(IterableDataset[dict[str, torch.Tensor]]):
     """Stream fixed-length next-token-prediction examples from token shards.
 
     Each example is a window of `block_size + 1` consecutive tokens: the
@@ -113,7 +114,7 @@ class TokenDataset(IterableDataset):
                 }
 
 
-class HellaswagDataset(Dataset):
+class HellaswagDataset(Dataset[dict[str, torch.Tensor]]):
     """HellaSwag examples, each a group of 4 tokenized candidate sequences.
 
     The `.npy` file holds `4 * N` rows of equal length `seq_len`: for every
@@ -168,7 +169,7 @@ def hellaswag_collate_fn(batch):
     example are consecutive rows that can be regrouped with
     `reshape(-1, 4)`.
     """
-    batch = default_collate(batch)
+    batch = cast(dict[str, torch.Tensor], default_collate(batch))
     return {
         k: v.flatten(0, 1) for k, v in batch.items()
     }

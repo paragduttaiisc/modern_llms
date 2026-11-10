@@ -212,6 +212,10 @@ def main(args: argparse.Namespace):
         save_steps=-1 if args.dont_save else args.save_interval,
         learning_rate=args.adamw_lr,
         weight_decay=args.adamw_weight_decay,
+        # Without these, HF's defaults (beta2 = 0.999) would apply.
+        adam_beta1=args.betas[0],
+        adam_beta2=args.betas[1],
+        adam_epsilon=args.optimizer_epsilon,
         # bf16 autocast, except with FSDP, where weights are already bf16
         bf16=not args.fsdp,
         # ZeRO-2: gradients and optimizer state sharded, weights gathered
@@ -284,10 +288,10 @@ if __name__ == "__main__":
     parser.add_argument("--muon-lr", type=float, default=2e-2)
     parser.add_argument("--muon-weight-decay", type=float, default=1e-2)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    # Not read anywhere in this script: the AdamW groups take their betas
-    # from the TrainingArguments defaults (adam_beta1/adam_beta2)
-    parser.add_argument("--betas", type=float, nargs=2, default=(0.9, 0.95))
-    parser.add_argument("--optimizer-epsilon", type=float, default=1e-8)
+    # AdamW betas and epsilon (passed on as TrainingArguments adam_beta1,
+    # adam_beta2 and adam_epsilon; Muon has its own momentum)
+    parser.add_argument("--betas", type=float, nargs=2, default=(0.9, 0.95), help="AdamW betas")
+    parser.add_argument("--optimizer-epsilon", type=float, default=1e-8, help="AdamW epsilon")
     # Weight of the MoE load-balancing loss
     parser.add_argument("--router-loss-weight", type=float, default=0.01)
     # Multi-token prediction
@@ -305,8 +309,6 @@ if __name__ == "__main__":
     # Scale: memory savings for larger models
     parser.add_argument("--fsdp", action="store_true", help="ZeRO-2 via FSDP2: shard gradients and optimizer state across GPUs (pure bf16 weights)")
     parser.add_argument("--activation-checkpointing", action="store_true", help="Recompute every transformer block in backward to save activation memory")
-    # Not read anywhere in this script
-    parser.add_argument("--use-fused-optimizer", type=bool, default=True)
     # Batch size per GPU, and tokens per optimizer step (all GPUs)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--effective-tokens-target", type=int, default=2**19)
