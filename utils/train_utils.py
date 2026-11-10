@@ -24,6 +24,7 @@ class LLMTrainer(Trainer):
             muon_weight_decay: float = 0.01,
             matryoshka_full_prob: float = 0.5,
             matryoshka_full_per_step: bool = False,
+            matryoshka_all_sizes: bool = False,
             **kwargs
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -42,6 +43,15 @@ class LLMTrainer(Trainer):
         # have no full-size gradient, and training diverges at muon_lr 0.02.
         self.matryoshka_full_per_step = matryoshka_full_per_step
         self._micro_batch_idx = 0
+        # Alternative to sampling: every micro-batch trains every size on
+        # the same tokens (loss = sum over sizes), so the full model sees
+        # exactly the data and gradient scale of a run without Matryoshka.
+        self.matryoshka_all_sizes =\
+            matryoshka_all_sizes and len(self.matryoshka_fracs) > 1
+        if self.matryoshka_all_sizes and matryoshka_full_per_step:
+            raise ValueError("matryoshka_all_sizes trains every size each "
+                             "micro-batch; don't combine it with "
+                             "matryoshka_full_per_step")
         # Per-size sums of per-token losses since the last log (see log())
         self._loss_window: dict[float, dict] = {}
 
@@ -218,24 +228,34 @@ class LLMTrainer(Trainer):
         return self._matryoshka_rng.choice(smaller)
 
     def training_step(self, model, inputs, *args, **kwargs) -> torch.Tensor:
-        frac = self._sample_matryoshka_frac()
-        self.model.active_frac = frac  # type: ignore
+        if self.matryoshka_all_sizes:
+            frac = 1.0
+            self.model.train_fracs = self.matryoshka_fracs  # type: ignore
+        else:
+            frac = self._sample_matryoshka_frac()
+            self.model.active_frac = frac  # type: ignore
         try:
             loss = super().training_step(model, inputs, *args, **kwargs)
         finally:
             self.model.active_frac = 1.0  # type: ignore  (eval/generation)
+            self.model.train_fracs = []  # type: ignore
         # Sum the per-token losses of this micro-batch into the current
         # logging window (detached tensors: no GPU sync here).
-        window = self._loss_window.setdefault(
-            frac, {"n": 0, "lm": None, "mtp": None})
-        lm = getattr(self.model, "last_lm_loss", None)
-        mtp = getattr(self.model, "last_mtp_losses", None)\
-            if getattr(self.model.config, "n_future_tokens", 1) > 1 else None
-        window["n"] += 1
-        for key, value in (("lm", lm), ("mtp", mtp)):
-            if value is not None:
-                window[key] = value if window[key] is None\
-                    else window[key] + value
+        if self.matryoshka_all_sizes:
+            per_size = self.model.last_losses_by_frac  # type: ignore
+        else:
+            mtp = getattr(self.model, "last_mtp_losses", None)\
+                if getattr(self.model.config, "n_future_tokens", 1) > 1\
+                else None
+            per_size = {frac: (getattr(self.model, "last_lm_loss", None), mtp)}
+        for size, (lm, mtp) in per_size.items():
+            window = self._loss_window.setdefault(
+                size, {"n": 0, "lm": None, "mtp": None})
+            window["n"] += 1
+            for key, value in (("lm", lm), ("mtp", mtp)):
+                if value is not None:
+                    window[key] = value if window[key] is None\
+                        else window[key] + value
 
         if "input_ids" in inputs:
             local_tokens = inputs["input_ids"].numel()

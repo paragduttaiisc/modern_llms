@@ -46,6 +46,10 @@ class Model(PreTrainedModel, GenerationMixin):
         # Matryoshka width used by forward() when no `matryoshka_frac` is
         # passed (the trainer sets it per micro-batch and per eval pass).
         self.active_frac = 1.0
+        # Matryoshka widths trained together on every training batch: the
+        # training loss is the sum of each width's loss on the same tokens.
+        # Empty = train only `active_frac` (set by the trainer).
+        self.train_fracs: list[float] = []
 
         self.tok_emb_table = nn.Embedding(
             config.vocab_size, config.embedding_size)
@@ -85,6 +89,9 @@ class Model(PreTrainedModel, GenerationMixin):
         self.last_lm_loss = None
         self.last_router_loss = None
         self.last_mtp_losses = None
+        # With train_fracs: {frac: (lm loss, MTP head losses | None)} of the
+        # last training forward, for the trainer's per-size logging.
+        self.last_losses_by_frac: dict = {}
 
     @torch.no_grad()
     def set_draft_vocab(self, token_ids: torch.Tensor) -> None:
@@ -377,8 +384,37 @@ class Model(PreTrainedModel, GenerationMixin):
 
         `matryoshka_frac` (default: `self.active_frac`) selects the nested
         width; a KV cache is only valid for the width it was built with.
+        With `train_fracs` set, a training forward with labels runs every
+        width in it on the same batch and returns the sum of their losses.
         """
+        if (
+            len(self.train_fracs) > 1
+            and matryoshka_frac is None
+            and self.training
+            and labels is not None
+            and not return_per_sample_loss
+        ):
+            return self._all_sizes_training_forward(
+                input_ids, attention_mask, labels, num_items_in_batch)
         frac = self.active_frac if matryoshka_frac is None else matryoshka_frac
+        return self._forward(input_ids, attention_mask, labels,
+                             num_items_in_batch, past_key_values, use_cache,
+                             return_per_sample_loss, frac)
+
+    def _forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        labels: torch.Tensor | None,
+        num_items_in_batch: int | None,
+        past_key_values: Cache | None,
+        use_cache: bool | None,
+        return_per_sample_loss: bool,
+        frac: float,
+    ) -> CausalLMOutputWithPast:
+        """forward() at width `frac`. Not `self.forward`: Accelerate wraps
+        that in autocast, and re-entering the wrapper per size inside one
+        compiled graph breaks dynamo."""
         use_cache = use_cache if use_cache is not None\
             else getattr(self.config, "use_cache", True)
         cache = past_key_values if use_cache else None
@@ -442,6 +478,36 @@ class Model(PreTrainedModel, GenerationMixin):
             loss=loss, # type: ignore
             past_key_values=past_key_values if use_cache else None, # type: ignore
         )
+
+    def _all_sizes_training_forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        labels: torch.Tensor,
+        num_items_in_batch: int | None,
+    ) -> CausalLMOutputWithPast:
+        """Sum of every `train_fracs` width's training loss on one batch.
+
+        Each width keeps weight 1, so the full model's gradient is the same
+        as in a run without Matryoshka, plus the smaller widths' gradients.
+        The logged `last_*` values are the full model's afterwards.
+        """
+        total, by_frac, full = None, {}, None
+        for frac in self.train_fracs:
+            loss = self._forward(
+                input_ids, attention_mask, labels, num_items_in_batch,
+                None, False, False, frac).loss
+            total = loss if total is None else total + loss
+            mtp = self.last_mtp_losses if self.n_future_tokens > 1 else None
+            by_frac[frac] = (self.last_lm_loss, mtp)
+            if frac == 1.0:
+                full = (self.last_lm_loss, self.last_mtp_losses,
+                        self.last_router_loss)
+        if full is not None:
+            self.last_lm_loss, self.last_mtp_losses, self.last_router_loss =\
+                full
+        self.last_losses_by_frac = by_frac
+        return CausalLMOutputWithPast(loss=total)  # type: ignore
 
     @torch.no_grad()
     def forward_all_heads(

@@ -95,7 +95,7 @@ Input Embedding
 - **Hyper-connections (mHC)** — Each layer has a learnable multi-stream routing mechanism (`MHCRouter`) that expands the input into `num_residual_streams` parallel streams. Each stream goes through its own MLA + FFN path, and streams are mixed via Sinkhorn-Knopp soft attention before being collapsed back. Uses learnable pre-mixing (`h_pre`), post-mixing (`h_post`), and residual mixing (`h_res`) parameters.
 - **Multi-token prediction (MTP)** — With `--n-future-tokens=n > 1`, the last block is replaced by `n` parallel single-block heads on a shared trunk (Gloeckle et al., 2024); head `i` predicts token `t+1+i` and all heads share the tied unembedding. Loss = head-0 loss + `mtp_loss_weight` × mean of the other heads. Each head runs under activation checkpointing so only one head's `[B, T, V]` logits are alive at a time. Eval loss, perplexity and HellaSwag use head 0 only. To cut the cost of the extra heads, they can predict over only the most frequent tokens (`draft_vocab_size`; targets outside it are ignored) and compute their loss on a random fraction of positions (`mtp_position_frac`). Head 0 always uses the full vocabulary and every position.
 - **Self-speculative decoding** — The MTP heads draft the next `n-1` tokens; one forward pass verifies them with head 0 and keeps the longest matching prefix (greedy, output identical to plain greedy decoding).
-- **Matryoshka (nested-width) training** — With `--matryoshka-fracs=1,0.5,0.25`, every smaller size `f` is a prefix slice of the full model: the first `f` of d_model, attention heads, MLA KV latent and FFN width in every block (incl. MTP heads), the first `f·d` columns of the tied embedding, and RMSNorm over the prefix dims. Head and RoPE dims are not nested. Each micro-batch trains one size (the full model with probability `--matryoshka-full-prob`; with `--matryoshka-full-per-step`, every optimizer step includes a full-model micro-batch), and every size is evaluated separately. `scripts/extract_matryoshka.py` slices out a standalone smaller checkpoint whose outputs equal the parent at that size.
+- **Matryoshka (nested-width) training** — With `--matryoshka-fracs=1,0.5,0.25`, every smaller size `f` is a prefix slice of the full model: the first `f` of d_model, attention heads, MLA KV latent and FFN width in every block (incl. MTP heads), the first `f·d` columns of the tied embedding, and RMSNorm over the prefix dims. Head and RoPE dims are not nested. By default each micro-batch trains one size (the full model with probability `--matryoshka-full-prob`; with `--matryoshka-full-per-step`, every optimizer step includes a full-model micro-batch). With `--matryoshka-all-sizes`, every micro-batch trains every size on the same tokens and the loss is their sum, so the full model sees the same data as a run without Matryoshka. Every size is evaluated separately. `scripts/extract_matryoshka.py` slices out a standalone smaller checkpoint whose outputs equal the parent at that size.
 - **Hybrid optimizer** — A single [muonium](https://pypi.org/project/muonium/) `Muon` optimizer with per-group algorithms: Muon for hidden 2-D weights (head-wise for Q / K-up / V-up) and 3-D MoE expert weights; AdamW for embeddings, the LM head, routers, mHC parameters and 1-D params. Both share one 3-phase LR schedule (warmup → cosine decay → constant plateau at 0.1×), with separate base LRs.
 
 </details>
@@ -176,6 +176,9 @@ Train the full model and nested 1/2- and 1/4-width models together (combinable w
 ```bash
 accelerate launch --num_processes=8 --mixed_precision=bf16 train.py --n-experts=1 --matryoshka-fracs=1,0.5,0.25 \
     --matryoshka-full-per-step --wandb-run-name="<RunName>"
+# or train every size on every micro-batch:
+accelerate launch --num_processes=8 --mixed_precision=bf16 train.py --n-experts=1 --matryoshka-fracs=1,0.25 \
+    --matryoshka-all-sizes --wandb-run-name="<RunName>"
 python scripts/extract_matryoshka.py --save-dir=outputs/checkpoint-xxx --frac=0.25 --out=outputs/checkpoint-xxx-f0.25
 ```
 
@@ -216,6 +219,7 @@ accelerate launch --num_processes=8 --mixed_precision=bf16 train.py --use-bf16 -
 | `--matryoshka-fracs` | `1` | Comma-separated nested widths trained jointly (1 = no nesting) |
 | `--matryoshka-full-prob` | 0.5 | Probability a micro-batch trains the full model (else a smaller size, uniformly) |
 | `--matryoshka-full-per-step` | off | First micro-batch of every optimizer step is the full model (the overall full share stays at `--matryoshka-full-prob`). Recommended: without it, steps with no full-size gradient made training diverge |
+| `--matryoshka-all-sizes` | off | Train every size on every micro-batch (loss = sum over sizes) instead of sampling one; `--matryoshka-full-prob` is then unused, and it cannot be combined with `--matryoshka-full-per-step` |
 | `--n-res-streams` | 1 | Number of residual streams for mHC routing (1 = plain residual) |
 | `--effective-tokens-target` | 2^19 | Target tokens for gradient accumulation calculation |
 | `--muon-lr` | 0.02 | Muon optimizer learning rate |
