@@ -120,6 +120,9 @@ class LLMTrainer(Trainer):
             optimizer step full width (see `_sample_matryoshka_frac`).
         matryoshka_all_sizes: train every width on every micro-batch instead
             of sampling one.
+        matryoshka_small_prob: with `matryoshka_all_sizes`, the full width
+            still trains on every micro-batch, but each smaller width joins
+            it only with this probability (1.0 = always).
     """
 
     def __init__(
@@ -133,6 +136,7 @@ class LLMTrainer(Trainer):
             matryoshka_full_prob: float = 0.5,
             matryoshka_full_per_step: bool = False,
             matryoshka_all_sizes: bool = False,
+            matryoshka_small_prob: float = 1.0,
             **kwargs
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -160,6 +164,13 @@ class LLMTrainer(Trainer):
             raise ValueError("matryoshka_all_sizes trains every size each "
                              "micro-batch; don't combine it with "
                              "matryoshka_full_per_step")
+        if not 0.0 < matryoshka_small_prob <= 1.0:
+            raise ValueError("matryoshka_small_prob must be in (0, 1]")
+        if matryoshka_small_prob < 1.0 and not self.matryoshka_all_sizes:
+            raise ValueError("matryoshka_small_prob needs matryoshka_all_sizes")
+        # Drawn from the same identically seeded RNG as the sampler, so all
+        # ranks include the same widths in every micro-batch.
+        self.matryoshka_small_prob = matryoshka_small_prob
         # Per-size sums of per-token losses since the last log (see log())
         self._loss_window: dict[float, dict[str, Any]] = {}
 
@@ -425,7 +436,10 @@ class LLMTrainer(Trainer):
         """
         if self.matryoshka_all_sizes:
             frac = 1.0
-            self._llm.train_fracs = self.matryoshka_fracs
+            self._llm.train_fracs = [1.0] + [
+                f for f in self.matryoshka_fracs[1:]
+                if self.matryoshka_small_prob >= 1.0
+                or self._matryoshka_rng.random() < self.matryoshka_small_prob]
         else:
             frac = self._sample_matryoshka_frac()
             self._llm.active_frac = frac
@@ -442,12 +456,13 @@ class LLMTrainer(Trainer):
             mtp = getattr(self._llm, "last_mtp_losses", None)\
                 if getattr(self._llm.config, "n_future_tokens", 1) > 1\
                 else None
-            per_size = {frac: (getattr(self._llm, "last_lm_loss", None), mtp)}
-        for size, (lm, mtp) in per_size.items():
+            per_size = {frac: (getattr(self._llm, "last_lm_loss", None), mtp,
+                               None)}
+        for size, (lm, mtp, kd) in per_size.items():
             window = self._loss_window.setdefault(
-                size, {"n": 0, "lm": None, "mtp": None})
+                size, {"n": 0, "lm": None, "mtp": None, "kd": None})
             window["n"] += 1
-            for key, value in (("lm", lm), ("mtp", mtp)):
+            for key, value in (("lm", lm), ("mtp", mtp), ("kd", kd)):
                 if value is not None:
                     window[key] = value if window[key] is None\
                         else window[key] + value
@@ -576,6 +591,8 @@ class LLMTrainer(Trainer):
             loss ~= lm_loss + mtp_loss_weight * mtp_loss
                     + router_loss_coef * router_loss
           - `mtp_loss_<k>`: head k alone (predicts token t+k)
+          - `kd_loss_f<size>`: KL from a nested width to the full model
+            (only with distillation)
           - `_f<size>` variants of all of these for smaller Matryoshka sizes
         Window means are averaged over all ranks, like HF's loss. HF calls
         log() with "loss" on every rank (right after its own all-gather), and
@@ -597,6 +614,11 @@ class LLMTrainer(Trainer):
                 logs[f"mtp_loss{suffix}"] = sum(means[2:]) / len(means[2:])
                 for i, head_loss in enumerate(means[1:]):
                     logs[f"mtp_loss_{i + 1}{suffix}"] = head_loss
+            if sums["kd"] is not None:
+                logs[f"kd_loss{suffix}"] = cast(
+                    torch.Tensor, self.accelerator.reduce(
+                        sums["kd"].float() / sums["n"], reduction="mean")
+                ).item()
 
     def log(self, logs: dict[str, Any], *args, **kwargs) -> None:
         """Add project metrics to HF's logs before they are reported.

@@ -13,6 +13,10 @@ Gloeckle et al. 2024) uses the model's own MTP heads as the drafter:
 Each forward pass therefore emits between 1 and n tokens, and the output is
 identical to plain greedy decoding (up to floating-point ties).
 
+The drafter can also be a separate model with MTP heads, such as a nested
+Matryoshka model: it drafts the n-1 tokens after the verified one, and the
+full model verifies them (`speculative_decode(..., draft_model=...)`).
+
 Both decoders here are written for clarity, not speed: batch size 1, a
 Python loop over steps, and an HF `DynamicCache`. `infer.py --speculative`
 runs both and compares their tokens per forward pass.
@@ -35,6 +39,8 @@ class DecodeResult:
     n_forwards: int
     # accepted_hist[a] = number of verify passes that accepted `a` drafts
     accepted_hist: list[int] = field(default_factory=list)
+    # forward passes of a separate draft model (0 for self-speculation)
+    n_draft_forwards: int = 0
 
     @property
     def tokens_per_forward(self) -> float:
@@ -83,29 +89,51 @@ def speculative_decode(
     input_ids: torch.Tensor,
     max_new_tokens: int,
     eos_token_id: int | None = None,
+    draft_model=None,
 ) -> DecodeResult:
-    """Greedy self-speculative decoding with the model's MTP heads.
+    """Greedy speculative decoding with MTP heads as the drafter.
 
-    Produces the same tokens as `greedy_decode` but uses fewer forward
-    passes when the extra heads' drafts are right. Every forward runs all
-    heads (`model.predict_all_heads`) on every fed position: each head has
-    its own KV-cache layer, and all layers must cover the same positions so
-    the cache can be cropped uniformly after a rejection.
+    Without `draft_model` this is self-speculative decoding: `model`'s own
+    MTP heads draft and its head 0 verifies. With `draft_model` (e.g. a
+    nested Matryoshka model extracted from `model`, trained with MTP heads),
+    the drafts come from `draft_model`'s heads and `model`'s next-token head
+    verifies; each model keeps its own KV cache, and both are cropped back
+    after a rejection. Either way the output equals `greedy_decode(model)`
+    (up to floating-point ties), with fewer forward passes of `model` when
+    the drafts are right.
 
-    `accepted_hist[a]` in the result counts verify passes that accepted
-    exactly `a` of the n-1 drafts.
+    Every forward of the drafter runs all its heads
+    (`predict_all_heads`) on every fed position: each head has its own
+    KV-cache layer, and all layers must cover the same positions so the
+    cache can be cropped uniformly.
+
+    `n_forwards` counts forwards of `model` and `n_draft_forwards` those of
+    `draft_model` (0 for self-speculation). `accepted_hist[a]` counts verify
+    passes that accepted exactly `a` of the n-1 drafts.
     """
     assert input_ids.shape[0] == 1, "batch size 1 only"
-    n = model.n_future_tokens
+    drafter = model if draft_model is None else draft_model
+    n = drafter.n_future_tokens
     if n < 2:
         raise ValueError("speculative decoding needs n_future_tokens > 1")
 
     cache = DynamicCache()
-    preds = model.predict_all_heads(input_ids, cache)  # [n, 1, T] token ids
+    draft_cache = cache if draft_model is None else DynamicCache()
+
+    def run(ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Feed `ids` [1, L] to both models; return the verifier's next-token
+        ids [L] and the drafter's per-head predictions [n, L]."""
+        preds = drafter.predict_all_heads(ids, draft_cache)[:, 0]
+        if draft_model is None:
+            return preds[0], preds
+        logits = model(ids, past_key_values=cache, use_cache=True).logits
+        return logits[0].argmax(-1), preds
+
+    verify, preds = run(input_ids)
     n_forwards = 1
-    # block[0]: verified next token, block[1:]: drafts for the tokens after it
-    # (head i at the last prompt position predicts token T+i)
-    block = preds[:, 0, -1]
+    # block[0]: verified next token, block[1:]: drafts for the tokens after
+    # it (head i at the last prompt position predicts token T+i)
+    block = torch.cat([verify[-1:], preds[1:, -1]])
     tokens: list[int] = []
     accepted_hist = [0] * n
 
@@ -118,17 +146,17 @@ def speculative_decode(
         # accepted; this pass both verifies the drafts and, at every
         # position, prepares the next block in case it ends up the last
         # accepted one.
-        preds = model.predict_all_heads(block[None, :], cache)
+        verify, preds = run(block[None, :])
         n_forwards += 1
-        # verify[j] = head-0 prediction for the token after block[j]
-        verify = preds[0, 0].tolist()
+        # verify[j] = the verifier's prediction for the token after block[j]
+        verify_list = verify.tolist()
         drafts = block.tolist()
         # Accept drafts left to right while they equal what greedy decoding
         # would have produced; stop at the first mismatch. Under greedy
         # decoding, verify[j] is exactly the next token once block[0..j] is
         # accepted, so every accepted draft is a token greedy would emit.
         n_acc = 0
-        while n_acc < n - 1 and verify[n_acc] == drafts[n_acc + 1]:
+        while n_acc < n - 1 and verify_list[n_acc] == drafts[n_acc + 1]:
             n_acc += 1
             tokens.append(drafts[n_acc])
             if _done(tokens, max_new_tokens, eos_token_id):
@@ -142,14 +170,19 @@ def speculative_decode(
         # layer (trunk and all heads) in this transformers version.
         if n_acc + 1 < n:
             cache.crop(-(n - (n_acc + 1)))
+            if draft_cache is not cache:
+                draft_cache.crop(-(n - (n_acc + 1)))
         # The predictions at the last accepted position only attended to
         # accepted tokens (causal mask), so they stay valid after the crop:
-        # head 0 gives the next verified token (the correction for the first
-        # rejected draft, or a bonus token if all were accepted), and heads
-        # 1..n-1 give the new drafts. No extra forward is needed.
-        block = preds[:, 0, n_acc]
+        # the verifier gives the next token (the correction for the first
+        # rejected draft, or a bonus token if all were accepted), and the
+        # drafter's heads 1..n-1 give the new drafts. No extra forward is
+        # needed.
+        block = torch.cat([verify[n_acc:n_acc + 1], preds[1:, n_acc]])
 
     # _done is checked after every appended token, so the slice is only a
     # safeguard against overshooting max_new_tokens.
-    return DecodeResult(tokens=tokens[:max_new_tokens], n_forwards=n_forwards,
-                        accepted_hist=accepted_hist)
+    return DecodeResult(
+        tokens=tokens[:max_new_tokens], n_forwards=n_forwards,
+        accepted_hist=accepted_hist,
+        n_draft_forwards=0 if draft_model is None else n_forwards)

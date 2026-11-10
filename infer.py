@@ -55,15 +55,21 @@ def _timed(fn, device: str):
     return result, time.perf_counter() - start
 
 
-def run_speculative(model, tokenizer, args: argparse.Namespace) -> None:
-    """Compare greedy decoding against MTP self-speculative decoding."""
+def run_speculative(model, tokenizer, args: argparse.Namespace,
+                    draft=None) -> None:
+    """Compare greedy decoding against MTP speculative decoding.
+
+    Without `draft` the model drafts for itself (self-speculation); with
+    `draft` (a nested Matryoshka model) the draft's MTP heads propose the
+    tokens and `model` verifies them.
+    """
     input_ids = torch.tensor(
         [tokenizer.encode(args.prompt)], device=args.device)
     eos = None if args.ignore_eos else tokenizer.eos_token_id
     run_greedy = lambda: greedy_decode(  # noqa: E731
         model, input_ids, args.max_new_tokens, eos)
     run_spec = lambda: speculative_decode(  # noqa: E731
-        model, input_ids, args.max_new_tokens, eos)
+        model, input_ids, args.max_new_tokens, eos, draft_model=draft)
     # Warm-up: the first calls pay for CUDA context setup, kernel selection
     # and allocator growth, which would distort the timings below.
     run_greedy(); run_spec()  # warm-up
@@ -88,8 +94,14 @@ def run_speculative(model, tokenizer, args: argparse.Namespace) -> None:
     print(f"Speculative:        {len(spec.tokens)} tokens, "
           f"{spec.n_forwards} forwards, {t_spec:.3f} s, "
           f"{len(spec.tokens) / t_spec:.1f} tok/s")
+    drafter = model if draft is None else draft
     print(f"Tokens per forward: {spec.tokens_per_forward:.2f} "
-          f"(max {model.n_future_tokens})")
+          f"(max {drafter.n_future_tokens})")
+    if draft is not None:
+        ratio = sum(p.numel() for p in draft.parameters())\
+            / sum(p.numel() for p in model.parameters())
+        print(f"Draft model:        {spec.n_draft_forwards} forwards of a "
+              f"model with {ratio:.0%} of the parameters")
     print(f"Speedup:            {t_greedy / t_spec:.2f}x")
     # Distribution of how many drafted tokens each verify pass accepted
     total = max(sum(spec.accepted_hist), 1)
@@ -105,6 +117,17 @@ def main(args: argparse.Namespace):
     AutoConfig.register("modern_transformer", ModelConfig)
     AutoModelForCausalLM.register(ModelConfig, Model)
     model = Model.from_pretrained(args.save_dir)
+    draft = None
+    if args.draft_frac > 0:
+        if not args.speculative or args.matryoshka_frac < 1.0:
+            raise ValueError("--draft-frac needs --speculative and the full "
+                             "model (--matryoshka-frac=1)")
+        # The nested model (with its MTP heads) drafts; the full model
+        # verifies.
+        draft = model.extract_matryoshka(args.draft_frac).to(args.device)
+        draft.eval()
+        print(f"Draft: Matryoshka size {args.draft_frac:g}, "
+              f"{sum(p.numel() for p in draft.parameters()) / 1e6:.1f}M params")
     if args.matryoshka_frac < 1.0:
         # A standalone smaller model built from prefix slices of every weight
         model = model.extract_matryoshka(args.matryoshka_frac)
@@ -114,7 +137,7 @@ def main(args: argparse.Namespace):
     model.eval()
     tokenizer = get_tokenizer()
     if args.speculative:
-        run_speculative(model, tokenizer, args)
+        run_speculative(model, tokenizer, args, draft)
         return
     generation_config = GenerationConfig(
         max_new_tokens=args.max_new_tokens,
@@ -190,6 +213,7 @@ if __name__ == "__main__":
     parser.add_argument("--speculative", action="store_true", help="Benchmark greedy vs. MTP self-speculative decoding (needs an MTP checkpoint)")
     parser.add_argument("--ignore-eos", action="store_true", help="Keep generating past EOS (for fixed-length benchmarks)")
     parser.add_argument("--matryoshka-frac", type=float, default=1.0, help="Run a smaller nested size (extracted from a Matryoshka checkpoint)")
+    parser.add_argument("--draft-frac", type=float, default=0.0, help="With --speculative: draft with this nested Matryoshka size's MTP heads and verify with the full model (0 = self-speculation)")
     args = parser.parse_args()
     set_seed(args.seed)
     main(args)

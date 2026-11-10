@@ -47,11 +47,13 @@ class ModelConfig(PreTrainedConfig):
             FFN outputs [--dropout].
         n_future_tokens, mtp_loss_weight, mtp_checkpoint, block_checkpoint,
         draft_vocab_size, mtp_position_frac, matryoshka_fracs,
+        mtp_nested_only, kd_weight, kd_position_frac,
         ff_hidden_exact: see the comments in `__init__`. CLI flags:
             --n-future-tokens, --mtp-loss-weight, --no-mtp-checkpoint
             (inverted), --activation-checkpointing, --draft-vocab-size,
-            --mtp-position-frac, --matryoshka-fracs (comma-separated);
-            `ff_hidden_exact` has no flag.
+            --mtp-position-frac, --matryoshka-fracs (comma-separated),
+            --mtp-nested-only, --matryoshka-kd-weight,
+            --matryoshka-kd-position-frac; `ff_hidden_exact` has no flag.
     """
     model_type = "modern_transformer"
 
@@ -79,6 +81,9 @@ class ModelConfig(PreTrainedConfig):
             draft_vocab_size: int = 0,
             mtp_position_frac: float = 1.0,
             matryoshka_fracs: list[float] | None = None,
+            mtp_nested_only: bool = False,
+            kd_weight: float = 0.0,
+            kd_position_frac: float = 0.25,
             ff_hidden_exact: bool = False,
             **kwargs
     ) -> None:
@@ -88,6 +93,17 @@ class ModelConfig(PreTrainedConfig):
         # and FFN width of every block (head / RoPE dims are not nested).
         self.matryoshka_fracs: list[float] = sorted(
             {1.0, *(matryoshka_fracs or [])}, reverse=True)
+        # Train the extra MTP heads only at the nested (smaller) widths: the
+        # full model learns next-token prediction alone, and a nested model
+        # with MTP heads serves as the draft model for speculative decoding.
+        self.mtp_nested_only = mtp_nested_only
+        # Distill every nested width toward the full model on the same batch:
+        # nested head i at position t is pulled (KL) toward the full model's
+        # next-token distribution at position t + i, i.e. what the full model
+        # would verify that draft against. Weight 0 disables it. The KL runs
+        # on a random `kd_position_frac` of the positions.
+        self.kd_weight = kd_weight
+        self.kd_position_frac = kd_position_frac
         # Use ff_hidden_size as the exact FFN width (no SwiGLU 2/3 + round);
         # set by Matryoshka extraction.
         self.ff_hidden_exact = ff_hidden_exact

@@ -77,6 +77,13 @@ class Model(PreTrainedModel, GenerationMixin):
             raise ValueError("MTP needs num_hidden_layers >= 2 (trunk + head)")
         for frac in config.matryoshka_fracs:
             config.matryoshka_dims(frac)  # validates every nested size
+        nested = len(config.matryoshka_fracs) > 1
+        if getattr(config, "mtp_nested_only", False) and not (
+                nested and config.n_future_tokens > 1):
+            raise ValueError("mtp_nested_only needs n_future_tokens > 1 and "
+                             "more than one Matryoshka size")
+        if getattr(config, "kd_weight", 0.0) > 0 and not nested:
+            raise ValueError("kd_weight > 0 needs more than one Matryoshka size")
         if len(config.matryoshka_fracs) > 1 and config.num_residual_streams > 1:
             raise NotImplementedError("Matryoshka nesting with mHC streams")
         # Matryoshka width used by forward() when no `matryoshka_frac` is
@@ -86,6 +93,12 @@ class Model(PreTrainedModel, GenerationMixin):
         # training loss is the sum of each width's loss on the same tokens.
         # Empty = train only `active_frac` (set by the trainer).
         self.train_fracs: list[float] = []
+        # Knowledge distillation between widths (see config.kd_weight): the
+        # full model's head-0 hidden states [B*T, C], detached, captured
+        # during the full-width forward of an all-sizes step and read by the
+        # nested widths' forwards on the same batch.
+        self._capture_teacher = False
+        self._kd_teacher: torch.Tensor | None = None
 
         self.tok_emb_table = nn.Embedding(
             config.vocab_size, config.embedding_size)
@@ -132,10 +145,11 @@ class Model(PreTrainedModel, GenerationMixin):
         self.last_lm_loss = None
         self.last_router_loss = None
         self.last_mtp_losses = None
+        self.last_kd_loss = None  # mean KL to the full model (nested widths)
         # With train_fracs: {frac: (lm loss, MTP head losses | None)} of the
         # last training forward, for the trainer's per-size logging.
-        self.last_losses_by_frac: dict[
-            float, tuple[torch.Tensor | None, torch.Tensor | None]] = {}
+        self.last_losses_by_frac: dict[float, tuple[
+            torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]] = {}
 
     @torch.no_grad()
     def set_draft_vocab(self, token_ids: torch.Tensor) -> None:
@@ -389,9 +403,14 @@ class Model(PreTrainedModel, GenerationMixin):
         targets: torch.Tensor,
         positions: torch.Tensor | None,
         frac: float,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Summed CE of one head, its MoE aux loss (0 if dense), and the
-        number of targets that counted.
+        kd_positions: torch.Tensor | None = None,
+        teacher: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+               torch.Tensor, torch.Tensor | None]:
+        """Summed CE of one head, its MoE aux loss (0 if dense), the number
+        of targets that counted, the summed KL to the teacher and its count
+        (both 0 without a teacher), and, while capturing the teacher, this
+        head's hidden states [B*T, C] (else None).
 
         The head block always runs on every position (attention needs
         them); only the unembedding + CE is restricted to `positions`
@@ -402,10 +421,21 @@ class Model(PreTrainedModel, GenerationMixin):
         `targets` is [B, T] token ids for this head (already shifted by the
         caller), with -100 where there is nothing to predict. The CE is
         summed, not averaged, so the caller can choose the normalization.
+
+        With `teacher` (the full model's head-0 hidden states [B*T, C]) and
+        `kd_positions`, the KL term of `_kd_sum` is computed here as well,
+        so it shares the checkpointed recompute.
         """
         h, router_loss = self._run_head(head_idx, x, None, 0, frac)
         h = h.reshape(-1, h.shape[-1])
+        T = targets.shape[-1]
         targets = targets.reshape(-1)
+        captured = h if self._capture_teacher and head_idx == 0 else None
+        if teacher is not None and kd_positions is not None:
+            kd_sum, kd_count = self._kd_sum(
+                head_idx, h, teacher, kd_positions, T)
+        else:
+            kd_sum = kd_count = torch.zeros((), device=h.device)
         if positions is not None:
             h, targets = h[positions], targets[positions]
         if self._uses_draft_vocab(head_idx):
@@ -424,7 +454,37 @@ class Model(PreTrainedModel, GenerationMixin):
             # A tensor, not None, so the return value can pass through
             # torch.utils.checkpoint.
             router_loss = torch.zeros((), device=ce.device, dtype=ce.dtype)
-        return ce, router_loss, (targets != -100).sum()
+        return (ce, router_loss, (targets != -100).sum(), kd_sum, kd_count,
+                captured)
+
+    def _kd_sum(
+        self,
+        head_idx: int,
+        h: torch.Tensor,
+        teacher: torch.Tensor,
+        kd_positions: torch.Tensor,
+        T: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Summed KL(teacher || student) of head `head_idx`, and its count.
+
+        `h` [B*T, C'] are this (nested) head's hidden states and `teacher`
+        [B*T, C] the full model's head-0 hidden states on the same batch.
+        Head i at position t drafts token t+1+i, which the full model
+        verifies with its next-token distribution at position t + i, so that
+        distribution is the target. Heads with a draft vocab are compared
+        over the draft vocab only (both distributions renormalized over it).
+        `kd_positions` are flattened B*T indices; those whose target
+        position t + i falls past the window are not counted.
+        """
+        valid = (kd_positions % T) + head_idx < T
+        target_pos = torch.where(valid, kd_positions + head_idx, kd_positions)
+        student = self._head_logits(head_idx, h[kd_positions]).float()
+        with torch.no_grad():
+            target = self._head_logits(head_idx, teacher[target_pos]).float()
+        kl = F.kl_div(
+            student.log_softmax(-1), target.log_softmax(-1),
+            log_target=True, reduction="none").sum(-1)
+        return (kl * valid).sum(), valid.sum()
 
     def _mtp_training_loss(
         self,
@@ -451,8 +511,17 @@ class Model(PreTrainedModel, GenerationMixin):
         n_valid_0 = (labels != -100).sum().clamp_min(1)
         pos_frac = self.config.mtp_position_frac
         n_sampled = max(1, round(pos_frac * B * T))
-        head_losses, logged_losses = [], []
-        for i in range(self.n_future_tokens):
+        head_losses, logged_losses, kd_means = [], [], []
+        # With mtp_nested_only, the full width trains head 0 alone.
+        n_heads = 1 if frac == 1.0 and getattr(
+            self.config, "mtp_nested_only", False) else self.n_future_tokens
+        teacher = self._kd_teacher if frac < 1.0 else None
+        kd_positions = None
+        if teacher is not None:  # same draw rules as `positions` below
+            n_kd = max(1, round(self.config.kd_position_frac * B * T))
+            kd_positions = torch.randperm(
+                B * T, device=labels.device)[:n_kd]
+        for i in range(n_heads):
             # labels[:, t] is token t+1; head i predicts token t+1+i, so its
             # targets are labels shifted left by i, padded with -100 at the
             # end where the target lies past this window.
@@ -464,12 +533,18 @@ class Model(PreTrainedModel, GenerationMixin):
             positions = torch.randperm(B * T, device=labels.device)[:n_sampled]\
                 if i > 0 and pos_frac < 1.0 else None
             if self.config.mtp_checkpoint:
-                ce, router_loss, n_valid = checkpoint(
-                    self._head_loss, i, x, targets, positions, frac,
-                    use_reentrant=False)
+                ce, router_loss, n_valid, kd_sum, kd_count, captured =\
+                    checkpoint(
+                        self._head_loss, i, x, targets, positions, frac,
+                        kd_positions, teacher, use_reentrant=False)
             else:
-                ce, router_loss, n_valid = self._head_loss(
-                    i, x, targets, positions, frac)
+                ce, router_loss, n_valid, kd_sum, kd_count, captured =\
+                    self._head_loss(i, x, targets, positions, frac,
+                                    kd_positions, teacher)
+            if captured is not None:
+                self._kd_teacher = captured.detach()
+            if teacher is not None:
+                kd_means.append(kd_sum / kd_count.clamp_min(1))
             # Extra heads see fewer targets (shifted ends, sampled positions,
             # out-of-draft-vocab targets); scale the trainer's token count
             # (num_items_in_batch, over all accumulation steps) accordingly
@@ -486,10 +561,16 @@ class Model(PreTrainedModel, GenerationMixin):
         # Head 0 is the ordinary next-token loss and keeps weight 1; the
         # extra heads act as an auxiliary objective.
         lm_loss = head_losses[0]
-        loss = lm_loss + self.config.mtp_loss_weight * head_losses[1:].mean()
+        loss = lm_loss
+        if n_heads > 1:
+            loss = loss + self.config.mtp_loss_weight * head_losses[1:].mean()
         aux_loss = torch.stack(aux_losses).mean() if aux_losses else None
         if aux_loss is not None:
             loss = loss + self.config.router_loss_coef * aux_loss
+        self.last_kd_loss = None
+        if kd_means:
+            loss = loss + self._kd_term(
+                torch.stack(kd_means).mean(), n_valid_0, num_items_in_batch)
 
         # Logged values are per-token means of this micro-batch, independent
         # of gradient-accumulation scaling.
@@ -543,7 +624,7 @@ class Model(PreTrainedModel, GenerationMixin):
                 score candidate endings.
         """
         if (
-            len(self.train_fracs) > 1
+            len(self.train_fracs) > 0
             and matryoshka_frac is None
             and self.training
             and labels is not None
@@ -638,6 +719,26 @@ class Model(PreTrainedModel, GenerationMixin):
                 if aux_loss is not None:
                     loss = lm_loss + self.config.router_loss_coef * aux_loss
 
+            # Distillation between widths (plain next-token models; the MTP
+            # path handles it in _mtp_training_loss).
+            self.last_kd_loss = None
+            if self.training and not return_per_sample_loss:
+                h_flat = h.reshape(-1, h.shape[-1])
+                if self._capture_teacher:
+                    self._kd_teacher = h_flat.detach()
+                teacher = self._kd_teacher if frac < 1.0 else None
+                if teacher is not None:
+                    n_kd = max(1, round(self.config.kd_position_frac * B * T))
+                    kd_positions = torch.randperm(
+                        B * T, device=labels.device)[:n_kd]
+                    kd_sum, kd_count = checkpoint(
+                        self._kd_sum, 0, h_flat, teacher, kd_positions, T,
+                        use_reentrant=False)
+                    loss = loss + self._kd_term(
+                        kd_sum / kd_count.clamp_min(1),
+                        (labels != -100).sum().clamp_min(1),
+                        num_items_in_batch)
+
             # Per-token mean of this micro-batch (not scaled by grad accum)
             self.last_lm_loss = per_token.detach().sum()\
                 / (labels != -100).sum().clamp_min(1)
@@ -649,6 +750,24 @@ class Model(PreTrainedModel, GenerationMixin):
             loss=loss,  # pyright: ignore[reportArgumentType]
             past_key_values=past_key_values if use_cache else None, # type: ignore
         )
+
+    def _kd_term(
+        self,
+        kd_mean: torch.Tensor,
+        n_valid: torch.Tensor,
+        num_items_in_batch: int | None,
+    ) -> torch.Tensor:
+        """Weighted KL loss to add to a micro-batch's loss.
+
+        `kd_mean` is a per-position mean. With `num_items_in_batch`, the
+        CE terms are divided by the token count of the whole accumulated
+        batch, so the KL is scaled by this micro-batch's share of it to get
+        the same weighting. Stashes the unscaled mean in `last_kd_loss`.
+        """
+        self.last_kd_loss = kd_mean.detach()
+        scale = 1.0 if num_items_in_batch is None\
+            else n_valid / num_items_in_batch
+        return self.config.kd_weight * kd_mean * scale
 
     def _all_sizes_training_forward(
         self,
@@ -663,24 +782,38 @@ class Model(PreTrainedModel, GenerationMixin):
         as in a run without Matryoshka, plus the smaller widths' gradients.
         The logged `last_*` values are the full model's afterwards.
 
+        With `kd_weight > 0`, the full width runs first and its head-0
+        hidden states are captured as the teacher for the nested widths'
+        KL terms (see `_kd_sum`); they are dropped when the step ends.
+
         Side effect: `last_losses_by_frac` maps each width to its
-        (lm loss, MTP head losses | None) for per-size logging. No cache is
-        used, and no logits are returned.
+        (lm loss, MTP head losses | None, KL to the full model | None) for
+        per-size logging. No cache is used, and no logits are returned.
         """
+        fracs = sorted(self.train_fracs, reverse=True)  # full width first
+        distill = getattr(self.config, "kd_weight", 0.0) > 0\
+            and fracs[0] == 1.0 and len(fracs) > 1
         total, by_frac, full = None, {}, None
-        for frac in self.train_fracs:
-            # Each _forward overwrites the last_* attributes, so they are
-            # copied out after every width.
-            # Always set: a training forward with labels returns a loss.
-            loss = cast(torch.Tensor, self._forward(
-                input_ids, attention_mask, labels, num_items_in_batch,
-                None, False, False, frac).loss)
-            total = loss if total is None else total + loss
-            mtp = self.last_mtp_losses if self.n_future_tokens > 1 else None
-            by_frac[frac] = (self.last_lm_loss, mtp)
-            if frac == 1.0:
-                full = (self.last_lm_loss, self.last_mtp_losses,
-                        self.last_router_loss)
+        try:
+            for frac in fracs:
+                self._capture_teacher = distill and frac == 1.0
+                # Each _forward overwrites the last_* attributes, so they
+                # are copied out after every width.
+                # Always set: a training forward with labels returns a loss.
+                loss = cast(torch.Tensor, self._forward(
+                    input_ids, attention_mask, labels, num_items_in_batch,
+                    None, False, False, frac).loss)
+                self._capture_teacher = False
+                total = loss if total is None else total + loss
+                mtp = self.last_mtp_losses if self.n_future_tokens > 1\
+                    else None
+                by_frac[frac] = (self.last_lm_loss, mtp, self.last_kd_loss)
+                if frac == 1.0:
+                    full = (self.last_lm_loss, self.last_mtp_losses,
+                            self.last_router_loss)
+        finally:
+            self._capture_teacher = False
+            self._kd_teacher = None
         if full is not None:
             self.last_lm_loss, self.last_mtp_losses, self.last_router_loss =\
                 full
@@ -769,6 +902,10 @@ class Model(PreTrainedModel, GenerationMixin):
         config.ff_hidden_size = hidden
         config.ff_hidden_exact = True
         config.matryoshka_fracs = [1.0]
+        # Training-only options of a nested model; the extracted model has
+        # a single width.
+        config.mtp_nested_only = False
+        config.kd_weight = 0.0
 
         def slice_param(name: str, w: torch.Tensor) -> torch.Tensor:
             """Prefix slice of state-dict entry `name` for width `frac`.

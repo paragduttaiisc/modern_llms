@@ -186,7 +186,9 @@ Muon momentum and AdamW moments are kept in fp32. All groups share one learning-
 
 - With `--matryoshka-fracs=1,0.5,0.25`, each smaller size *f* uses the first *f* of every width: d_model, attention heads, MLA latent and FFN width, in every block including the MTP heads. RMSNorm normalizes over the prefix dims. Head and RoPE sizes are not nested.
 - By default each micro-batch trains one size (the full model with probability `--matryoshka-full-prob`). `--matryoshka-full-per-step` makes every optimizer step include a full-size micro-batch, which keeps training stable.
-- With `--matryoshka-all-sizes`, every micro-batch trains every size on the same tokens and the loss is their sum, so the full model sees exactly the data of a run without nesting.
+- With `--matryoshka-all-sizes`, every micro-batch trains every size on the same tokens and the loss is their sum, so the full model sees exactly the data of a run without nesting. `--matryoshka-small-prob=p` keeps the full model on every micro-batch but adds each smaller size only with probability *p*.
+- **Nested draft model.** `--mtp-nested-only` trains the extra MTP heads only at the smaller sizes, so the full model learns next-token prediction alone and a nested model with MTP heads becomes a cheap draft model.
+- **Distillation.** `--matryoshka-kd-weight` adds a KL term that pulls each nested head *i* at position *t* toward the full model's next-token distribution at *t + i*. That is the prediction the full model checks the draft against, so the term directly targets draft acceptance.
 - `scripts/extract_matryoshka.py` slices out a standalone smaller checkpoint whose outputs equal the parent model's at that size.
 
 </details>
@@ -284,12 +286,19 @@ On a 1B-token sample of `web_small_10B`, the top 8,192 tokens cover 95.6% of all
 accelerate launch --num_processes=8 --mixed_precision=bf16 train.py --n-experts=1 \
     --matryoshka-fracs=1,0.25 --matryoshka-all-sizes --wandb-run-name="<RunName>"
 
+# Nested draft model: the full model always trains (next-token only); the quarter-width
+# model joins half the micro-batches, with 4 MTP heads distilled toward the full model
+accelerate launch --num_processes=8 --mixed_precision=bf16 train.py --n-experts=1 \
+    --matryoshka-fracs=1,0.25 --matryoshka-all-sizes --matryoshka-small-prob=0.5 \
+    --n-future-tokens=4 --mtp-nested-only --matryoshka-kd-weight=1.0 \
+    --draft-vocab-size=16384 --mtp-position-frac=0.5 --wandb-run-name="<RunName>"
+
 # Save the quarter-width model as its own checkpoint
 python scripts/extract_matryoshka.py --save-dir=outputs/checkpoint-xxx --frac=0.25 \
     --out=outputs/checkpoint-xxx-f0.25
 ```
 
-Every size must give whole-number dimensions (768·f, 12·f heads, 128·f latent, FFN width·f). Per-size metrics get an `_f<size>` suffix, e.g. `lm_loss_f0.25` and `eval_f0.25_loss`.
+Every size must give whole-number dimensions (768·f, 12·f heads, 128·f latent, FFN width·f). Per-size metrics get an `_f<size>` suffix, e.g. `lm_loss_f0.25`, `eval_f0.25_loss` and `kd_loss_f0.25`.
 
 ### Command-line arguments
 
@@ -345,6 +354,10 @@ Every size must give whole-number dimensions (768·f, 12·f heads, 128·f latent
 |---|---|---|
 | `--matryoshka-fracs` | `1` | Comma-separated nested widths, e.g. `1,0.5,0.25` (1 = no nesting) |
 | `--matryoshka-all-sizes` | off | Train every size on every micro-batch (loss = sum over sizes) |
+| `--matryoshka-small-prob` | 1.0 | With `--matryoshka-all-sizes`: probability each smaller size joins a micro-batch (the full size always trains) |
+| `--mtp-nested-only` | off | Train the extra MTP heads only at the smaller sizes (needs `--n-future-tokens > 1`) |
+| `--matryoshka-kd-weight` | 0.0 | Weight of the KL distilling every head of the smaller sizes toward the full model (0 = off) |
+| `--matryoshka-kd-position-frac` | 0.25 | Fraction of positions used for that KL |
 | `--matryoshka-full-prob` | 0.5 | When sampling: probability a micro-batch trains the full model |
 | `--matryoshka-full-per-step` | off | When sampling: every optimizer step includes a full-size micro-batch (recommended; prevents divergence) |
 
@@ -385,7 +398,7 @@ python infer.py --save-dir=outputs/checkpoint-xxx --prompt "Hello" --use-cache \
 python infer.py --save-dir=outputs/checkpoint-xxx --prompt "Hello" --speculative --max-new-tokens=256
 ```
 
-Add `--matryoshka-frac=0.25` to run a smaller nested size of a Matryoshka checkpoint (this also works with `--speculative`).
+Add `--matryoshka-frac=0.25` to run a smaller nested size of a Matryoshka checkpoint (this also works with `--speculative`). For a checkpoint trained with `--mtp-nested-only`, `--speculative --draft-frac=0.25` drafts with the quarter-width model's MTP heads and verifies with the full model, so the output still equals the full model's greedy decoding.
 
 ## 📊 Evaluation and logging
 

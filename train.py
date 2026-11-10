@@ -158,6 +158,9 @@ def main(args: argparse.Namespace):
         draft_vocab_size=args.draft_vocab_size if args.n_future_tokens > 1 else 0,
         mtp_position_frac=args.mtp_position_frac,
         matryoshka_fracs=matryoshka_fracs,
+        mtp_nested_only=args.mtp_nested_only,
+        kd_weight=args.matryoshka_kd_weight,
+        kd_position_frac=args.matryoshka_kd_position_frac,
     ))
     if model.config.draft_vocab_size > 0:
         # Draft vocab of the extra MTP heads = most frequent training tokens.
@@ -228,7 +231,10 @@ def main(args: argparse.Namespace):
         project=args.wandb_project,
         max_grad_norm=args.max_grad_norm,
         dataloader_num_workers=1,
-        ddp_find_unused_parameters=False,
+        # With --mtp-nested-only, the extra MTP heads are unused on
+        # micro-batches that train only the full width, which DDP must be
+        # told about.
+        ddp_find_unused_parameters=args.mtp_nested_only,
         # wandb if a run name is given, else TensorBoard (or nothing)
         report_to="wandb" if args.wandb_run_name else\
             "none" if args.dont_log else "tensorboard",
@@ -246,6 +252,7 @@ def main(args: argparse.Namespace):
         matryoshka_full_prob=args.matryoshka_full_prob,
         matryoshka_full_per_step=args.matryoshka_full_per_step,
         matryoshka_all_sizes=args.matryoshka_all_sizes,
+        matryoshka_small_prob=args.matryoshka_small_prob,
     )
     if accelerator.is_main_process:
         print("Starting training...")
@@ -306,6 +313,10 @@ if __name__ == "__main__":
     parser.add_argument("--matryoshka-full-prob", type=float, default=0.5, help="Probability a micro-batch trains the full model (else a smaller size, uniformly)")
     parser.add_argument("--matryoshka-full-per-step", action="store_true", help="Make the first micro-batch of every optimizer step full size (recommended: prevents divergence)")
     parser.add_argument("--matryoshka-all-sizes", action="store_true", help="Train every Matryoshka size on every micro-batch (loss = sum over sizes) instead of sampling one")
+    parser.add_argument("--matryoshka-small-prob", type=float, default=1.0, help="With --matryoshka-all-sizes: probability that each smaller size joins a micro-batch (the full size always trains)")
+    parser.add_argument("--mtp-nested-only", action="store_true", help="Train the extra MTP heads only at the smaller Matryoshka sizes (the full model trains next-token prediction alone)")
+    parser.add_argument("--matryoshka-kd-weight", type=float, default=0.0, help="Weight of the KL term distilling each smaller size (all its MTP heads) toward the full model; 0 = off")
+    parser.add_argument("--matryoshka-kd-position-frac", type=float, default=0.25, help="Fraction of positions used for the distillation KL")
     # Scale: memory savings for larger models
     parser.add_argument("--fsdp", action="store_true", help="ZeRO-2 via FSDP2: shard gradients and optimizer state across GPUs (pure bf16 weights)")
     parser.add_argument("--activation-checkpointing", action="store_true", help="Recompute every transformer block in backward to save activation memory")
