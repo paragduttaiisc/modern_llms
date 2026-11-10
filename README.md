@@ -229,7 +229,7 @@ python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-**Data:** training reads `.npy` token shards listed in a JSON manifest, `{"train": [...], "val": [...]}`, with paths relative to the repository root (default `data/web_small_10B.json`). Each shard holds 20M tokens. HellaSwag evaluation reads `data/Hellaswag/hellaswag_tokenized.npy`.
+**Data:** training reads `.npy` token shards listed in a JSON manifest, `{"train": [...], "val": [...]}`, with paths relative to the repository root (default `data/web_small_10B.json`). Each shard holds 20M tokens and comes from a single source. Training mixes the windows of 16 shards at a time in a seeded random order (`--interleave-shards`), so every batch mixes the sources even though shards are read in manifest order; `--interleave-shards=1` reads shards one after another. Resuming (`--resume-training`) continues with exactly the next unseen window. HellaSwag evaluation reads `data/Hellaswag/hellaswag_tokenized.npy`.
 
 ## 🎯 Training
 
@@ -256,14 +256,26 @@ accelerate launch --num_processes=8 --mixed_precision=bf16 train.py \
 - **Precision:** weights and gradients stay bf16. Mixed precision is turned off, so Accelerate doesn't upcast them to fp32; the loss and softmaxes still run in fp32.
 - **Memory:** `--activation-checkpointing` recomputes each block in the backward pass to save activation memory.
 
-Example: a GPT-3 Large-shaped MoE (24 layers, d_model 1536, 16 heads of 96) with 12 experts, 3 active per token: **2.95B total / 0.91B active parameters**.
+Example: a GPT-3 Large-shaped MoE (24 layers, d_model 1536, 16 heads of 96) with 8 experts, 2 active per token: **2.72B total / 0.85B active parameters**, trained on 100B tokens with a GPT-3-style schedule (0.5M tokens per step, 375M-token warmup, cosine decay to 10% at 260/300 of training).
 
 ```bash
 accelerate launch --num_processes=8 train.py --fsdp \
     --embed-size=1536 --n-layers=24 --n-heads=16 --attn-head-size=96 --rope-size=32 \
-    --kv-latent-size=384 --mlp-hidden-size=3072 --n-experts=12 --n-active-experts=3 \
-    --batch-size=4 --shard-list-file=data/llm_mix_100B.json --wandb-run-name="<RunName>"
+    --kv-latent-size=384 --mlp-hidden-size=4096 --n-experts=8 --n-active-experts=2 \
+    --batch-size=4 --shard-list-file=data/llm_mix_100B.json \
+    --n-iters=190735 --warmup-iters=715 --last-decay-iter=165300 \
+    --eval-interval=2000 --save-interval=5000 --wandb-run-name="<RunName>"
 ```
+
+Measured on 8× A100-40GB (FSDP, compile, batch 4 per GPU, 25 steps):
+
+| Experts / active | `--mlp-hidden-size` | Total params | Peak memory | Tokens/s | 100B tokens |
+|---|---|---|---|---|---|
+| **8 / 2** | **4096** | 2.72B | 31.7 GB | 116.9k | ≈ 9.9 days |
+| 12 / 3 | 3072 | 2.95B | 38.1 GB | 103.9k | ≈ 11.1 days |
+| 16 / 4 | 2048 | 2.95B | 35.7 GB | 98.8k | ≈ 11.7 days |
+
+Batch 8 per GPU runs out of memory for 8/2 and 12/3 without `--activation-checkpointing`.
 
 ### Multi-token prediction
 
@@ -381,6 +393,7 @@ Every size must give whole-number dimensions (768·f, 12·f heads, 128·f latent
 | `--fsdp` | off | ZeRO-2 via FSDP2 (pure-bf16 weights and gradients) |
 | `--activation-checkpointing` | off | Recompute each block in backward |
 | `--shard-list-file` | `data/web_small_10B.json` | Data manifest |
+| `--interleave-shards` | 16 | Mix the windows of this many shards at a time (1 = read shards in order) |
 | `--eval-interval` / `--save-interval` | 500 / 5000 | Steps between evals / checkpoints |
 | `--resume-training` | off | Resume from the latest checkpoint in `--save-dir` |
 | `--wandb-run-name` | — | Log to WandB under this name |

@@ -122,7 +122,8 @@ def main(args: argparse.Namespace):
     trainset = TokenDataset(
         args.shard_list_file, block_size=args.block_size, subset="train",
         resume_iter=resume_iter, batch_size=effective_token_size *
-        grad_accum_steps)
+        grad_accum_steps, interleave_shards=args.interleave_shards,
+        seed=args.seed)
     valset = TokenDataset(
         args.shard_list_file, block_size=args.block_size, subset="val")
     if accelerator.is_main_process:
@@ -254,6 +255,8 @@ def main(args: argparse.Namespace):
         matryoshka_full_per_step=args.matryoshka_full_per_step,
         matryoshka_all_sizes=args.matryoshka_all_sizes,
         matryoshka_small_prob=args.matryoshka_small_prob,
+        muon_lr_range=tuple(args.muon_lr_range_test)
+            if args.muon_lr_range_test else None,
     )
     if accelerator.is_main_process:
         print("Starting training...")
@@ -267,6 +270,7 @@ if __name__ == "__main__":
     # Data and reproducibility
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--shard-list-file", type=str, default="data/web_small_10B.json")
+    parser.add_argument("--interleave-shards", type=int, default=16, help="Mix the windows of this many training shards at a time in a seeded random order, so batches mix data sources (1 = read shards in order)")
     parser.add_argument("--save-dir", type=str, default="outputs")
     # Model shape. vocab_size must match the tokenizer (49216).
     parser.add_argument("--vocab-size", type=int, default=49216)
@@ -296,6 +300,7 @@ if __name__ == "__main__":
     parser.add_argument("--adamw-weight-decay", type=float, default=0.1)
     parser.add_argument("--muon-lr", type=float, default=2e-2)
     parser.add_argument("--muon-weight-decay", type=float, default=1e-2)
+    parser.add_argument("--muon-lr-range-test", type=float, nargs=2, default=None, metavar=("LO", "HI"), help="LR range test: Muon LR rises exponentially from LO to HI over --n-iters steps; AdamW stays at --adamw-lr (no warmup/decay)")
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     # AdamW betas and epsilon (passed on as TrainingArguments adam_beta1,
     # adam_beta2 and adam_epsilon; Muon has its own momentum)

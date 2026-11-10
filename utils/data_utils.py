@@ -11,7 +11,7 @@ from typing import Any, cast
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, IterableDataset
+from torch.utils.data import Dataset, IterableDataset, get_worker_info
 from torch.utils.data._utils.collate import default_collate
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
@@ -56,20 +56,34 @@ class TokenDataset(IterableDataset[dict[str, torch.Tensor]]):
     first `block_size` are the input and the last `block_size` (shifted by
     one) are the labels. Windows do not overlap (consecutive windows share
     one boundary token, the last label of one is the first input of the
-    next), are read in shard order and are not shuffled. The leftover tail
-    of each shard that does not fill a window is dropped. Every example
-    yields `input_ids`, `attention_mask` (all ones) and `labels`, each a
-    `[block_size]` int64 tensor.
+    next). The leftover tail of each shard that does not fill a window is
+    dropped. Every example yields `input_ids`, `attention_mask` (all ones)
+    and `labels`, each a `[block_size]` int64 tensor.
+
+    Order: with `interleave_shards = 1`, windows are read shard by shard in
+    order. Each shard comes from a single source (web, code, math...) and
+    holds 2e7 tokens, about 38 optimizer steps of 2^19 tokens, so every
+    batch would come from one source for dozens of steps at a time even if
+    the shard list itself is shuffled. With `interleave_shards = K > 1`, the
+    shards are taken K at a time and all windows of a block are yielded in a
+    random order, so each batch mixes the sources in roughly the corpus
+    proportions. The order is seeded by `seed` and the block's position in
+    the full shard list, so it is reproducible and survives resuming.
 
     Args:
         shard_list_file: JSON manifest `{"train": [...], "val": [...]}` of
             `.npy` shard paths (relative to the repo root).
         block_size: sequence length of each example.
         subset: which manifest key to read.
-        resume_iter: optimizer step being resumed from. Whole shards already
-            consumed by `resume_iter` steps are skipped.
+        resume_iter: optimizer step being resumed from. Exactly the
+            windows consumed by `resume_iter` steps are skipped, so a resumed
+            run continues with the next unseen window (shard lengths are read
+            from the `.npy` headers).
         batch_size: tokens consumed per optimizer step (over all ranks and
             gradient-accumulation steps), used only for resume skipping.
+        interleave_shards: number of shards whose windows are mixed (1 =
+            read in order).
+        seed: seed of the window order when interleaving.
     """
 
     def __init__(
@@ -78,40 +92,87 @@ class TokenDataset(IterableDataset[dict[str, torch.Tensor]]):
             block_size: int,
             subset: str = "train",
             resume_iter: int = 0,
-            batch_size: int = 2**19
+            batch_size: int = 2**19,
+            interleave_shards: int = 1,
+            seed: int = 0,
     ) -> None:
         self.block_size = block_size
+        self.interleave_shards = max(1, interleave_shards)
+        self.seed = seed
         with open(shard_list_file, 'r') as f:
             data = json.load(f)
         self.shard_paths = data[subset]
+        # Index (in blocks of interleave_shards) of the first block left after
+        # resume skipping, which keeps each block's shuffle seed the same as
+        # in the original run, and the number of windows of that block that
+        # were already consumed.
+        self.first_block = 0
+        self.skip_windows = 0
         if resume_iter > 0:
-            # Every shard is assumed to hold 2e7 tokens. Skipping is at shard
-            # granularity, so a partly consumed shard is replayed from its
-            # start. (train.py sets `ignore_data_skip=True`, so HF does not
-            # also skip batches on resume.)
-            total_tokens_consumed = batch_size * resume_iter
-            num_shards_consumed = int(total_tokens_consumed // 2e7)
-            self.shard_paths = self.shard_paths[num_shards_consumed:]
+            # Skip exactly the windows already trained on: whole blocks, then
+            # the consumed part of the current block in its (seeded) order.
+            # (train.py sets `ignore_data_skip=True`, so HF does not also
+            # skip batches on resume.)
+            remaining = resume_iter * batch_size // block_size
+            K = self.interleave_shards
+            for b in range(0, len(self.shard_paths), K):
+                n = sum(self._n_windows(path)
+                        for path in self.shard_paths[b:b + K])
+                if remaining < n:
+                    break
+                remaining -= n
+                self.first_block += 1
+            self.skip_windows = remaining
+            self.shard_paths = self.shard_paths[self.first_block * K:]
+
+    def _n_windows(self, path: str) -> int:
+        """Number of windows in a shard (reads only the .npy header)."""
+        return (np.load(path, mmap_mode="r").shape[0] - 1) // self.block_size
+
+    def _example(self, seq: np.ndarray) -> dict[str, torch.Tensor]:
+        """One `block_size + 1`-token window -> input_ids / mask / labels."""
+        # .copy(): from_numpy shares memory, so without a copy each tensor
+        # would be a view that keeps the whole shard (or its mmap) alive.
+        input_ids = torch.from_numpy(seq[:-1].copy()).long()
+        return {
+            "input_ids": input_ids,
+            "attention_mask": torch.ones_like(input_ids),
+            "labels": torch.from_numpy(seq[1:].copy()).long(),
+        }
 
     def __iter__(self):
-        """Yield examples shard by shard, loading one shard at a time."""
-        for shard_path in self.shard_paths:
-            tokens = np.load(shard_path)
-            n_examples = (len(tokens) - 1) // self.block_size
-            for i in range(n_examples):
-                start_idx = i * self.block_size
-                end_idx = start_idx + self.block_size + 1
-                seq = tokens[start_idx:end_idx]
-                # .copy(): from_numpy shares memory, so without a copy each
-                # tensor would be a view that keeps the whole shard alive.
-                input_ids = torch.from_numpy(seq[:-1].copy()).long()
-                attention_mask = torch.ones_like(input_ids)
-                labels = torch.from_numpy(seq[1:].copy()).long()
-                yield {
-                    "input_ids": input_ids,
-                    "attention_mask": attention_mask,
-                    "labels": labels,
-                }
+        """Yield examples shard by shard, or block by block (shuffled)."""
+        info = get_worker_info()
+        if info is not None and info.num_workers > 1:
+            # Every worker would iterate the full stream, so each window
+            # would be yielded num_workers times.
+            raise RuntimeError("TokenDataset is a single stream; use at most "
+                               "one DataLoader worker")
+        bs = self.block_size
+        skip = self.skip_windows
+        if self.interleave_shards == 1:
+            for shard_path in self.shard_paths:
+                tokens = np.load(shard_path)
+                for i in range(skip, (len(tokens) - 1) // bs):
+                    yield self._example(tokens[i * bs:i * bs + bs + 1])
+                skip = 0
+            return
+        K = self.interleave_shards
+        for b in range(0, len(self.shard_paths), K):
+            # Memory-mapped: only the windows actually read are paged in, so
+            # a block of K shards costs no more RAM than one loaded shard.
+            shards = [np.load(path, mmap_mode="r")
+                      for path in self.shard_paths[b:b + K]]
+            counts = [(len(tokens) - 1) // bs for tokens in shards]
+            shard_ids = np.repeat(np.arange(len(shards)), counts)
+            window_ids = np.concatenate([np.arange(c) for c in counts])
+            rng = np.random.default_rng([self.seed, self.first_block + b // K])
+            order = rng.permutation(len(shard_ids))[skip:]
+            skip = 0
+            for j in order:
+                start = int(window_ids[j]) * bs
+                yield self._example(
+                    np.asarray(shards[shard_ids[j]][start:start + bs + 1]))
 
 
 class HellaswagDataset(Dataset[dict[str, torch.Tensor]]):

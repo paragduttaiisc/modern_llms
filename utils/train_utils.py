@@ -46,7 +46,32 @@ class MuonFP32State(Muon):
     updates to it. The fp32 moments double the AdamW state memory, but only
     for the AdamW params (embeddings, norms, routers). Muon groups are
     untouched.
+
+    `compile_update=False` runs muonium's Muon update uncompiled. muonium
+    normally wraps it in `torch.compile(dynamic=True)`; with FSDP2 the
+    parameters are DTensors whose local shard shapes differ across ranks,
+    and compiling that update stalled for 40+ minutes on 6 GPUs and
+    segfaulted on 8 (A100, torch 2.14). The uncompiled update still uses
+    muonium's Triton Newton-Schulz kernel.
     """
+
+    def __init__(self, *args, compile_update: bool = True, **kwargs):
+        self.compile_update = compile_update
+        super().__init__(*args, **kwargs)
+
+    def _get_muon_impl(self, algorithm):
+        if self.compile_update:
+            return super()._get_muon_impl(algorithm)
+        raw = self._raw_muon_impl(algorithm)
+
+        def impl(*args, lr, **kwargs):
+            # muonium keeps `lr` as a 0-dim CPU tensor; its eager foreach
+            # update multiplies it with the per-matrix lr ratios on the GPU,
+            # which torch._foreach_mul rejects (torch.compile tolerates it).
+            # A Python float works on either device.
+            return raw(*args, lr=float(lr) if torch.is_tensor(lr) else lr,  # pyright: ignore[reportArgumentType]
+                       **kwargs)
+        return impl
 
     def _step_adam_group(self, group: dict[str, Any]) -> None:
         """One AdamW step for `group`, overriding muonium's version.
@@ -123,6 +148,10 @@ class LLMTrainer(Trainer):
         matryoshka_small_prob: with `matryoshka_all_sizes`, the full width
             still trains on every micro-batch, but each smaller width joins
             it only with this probability (1.0 = always).
+        muon_lr_range: (lo, hi) for a learning-rate range test: the Muon LR
+            grows exponentially from lo to hi over the run, while AdamW stays
+            at its base LR (no warmup or decay for either). See
+            `create_scheduler`.
     """
 
     def __init__(
@@ -137,6 +166,7 @@ class LLMTrainer(Trainer):
             matryoshka_full_per_step: bool = False,
             matryoshka_all_sizes: bool = False,
             matryoshka_small_prob: float = 1.0,
+            muon_lr_range: tuple[float, float] | None = None,
             **kwargs
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -179,6 +209,7 @@ class LLMTrainer(Trainer):
         self.last_decay_iter = last_decay_iter
 
         self.muon_lr = muon_lr
+        self.muon_lr_range = muon_lr_range
         self.muon_weight_decay = muon_weight_decay
 
         self.total_tokens = 0
@@ -346,7 +377,10 @@ class LLMTrainer(Trainer):
         }], lr=self.muon_lr, wd=self.muon_weight_decay,
         orthogonalization_strategy="newton_schulz", use_cautious_wd=False,
         adam_betas=(self.args.adam_beta1, self.args.adam_beta2),
-        adam_eps=self.args.adam_epsilon, is_adamw=True, foreach=None)
+        adam_eps=self.args.adam_epsilon, is_adamw=True, foreach=None,
+        # Compiling muonium's update over FSDP2 DTensors stalls or crashes;
+        # see MuonFP32State.
+        compile_update=not self.is_fsdp_enabled)
 
         return self.optimizer
 
@@ -369,6 +403,26 @@ class LLMTrainer(Trainer):
             return self.lr_scheduler
 
         optimizer = optimizer if optimizer is not None else self.optimizer
+
+        if self.muon_lr_range is not None:
+            # Learning-rate range test (as in Karpathy's makemore lecture):
+            # one short run whose Muon LR rises exponentially, so a plot of
+            # loss against LR shows where learning is fastest and where it
+            # becomes unstable. Each param group gets its own multiplier:
+            # Muon groups sweep lo -> hi (relative to their base LR), and
+            # AdamW groups stay at 1.0.
+            lo, hi = self.muon_lr_range
+            steps = max(1, num_training_steps - 1)
+            base = self.muon_lr
+
+            def muon_range(step: int) -> float:
+                return (lo / base) * (hi / lo) ** (min(step, steps) / steps)
+
+            assert optimizer is not None
+            self.lr_scheduler = LambdaLR(optimizer, lr_lambda=[
+                muon_range if group.get("use_muon") else (lambda step: 1.0)
+                for group in optimizer.param_groups])
+            return self.lr_scheduler
 
         warmup_iters = self.warmup_iters
         decay_end = self.last_decay_iter
